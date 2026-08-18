@@ -185,11 +185,13 @@ class AttachBridge:
             return None
         return RemoteControlMirror(
             slug,
-            send_plain_id=lambda text, parse_mode=None, reply_markup=None: self.tg.send_plain_id(
-                self._owner_chat, text, parse_mode=parse_mode, reply_markup=reply_markup),
+            send_plain_id=lambda text, parse_mode=None, reply_markup=None, silent=False:
+                self.tg.send_plain_id(self._owner_chat, text, parse_mode=parse_mode,
+                                      reply_markup=reply_markup, silent=silent),
             edit_plain=lambda mid, text, parse_mode=None, reply_markup=None: self.tg.edit_plain(
                 self._owner_chat, mid, text, parse_mode=parse_mode, reply_markup=reply_markup),
-            send_text=lambda text, parse_mode="auto": self._send_final(text, parse_mode=parse_mode),
+            send_text=lambda text, parse_mode="auto", silent=False:
+                self._send_final(text, parse_mode=parse_mode, silent=silent),
             status_push=self._status_push,
             status_clear=self._status_clear,
             set_active=lambda on: (self._remote_active.set() if on
@@ -432,12 +434,14 @@ class AttachBridge:
         except OSError:
             pass
 
-    def _enqueue(self, text: str, key: str | None, parse_mode: str = "auto") -> None:
-        self._pending_send.append({"text": text, "key": key, "parse_mode": parse_mode})
+    def _enqueue(self, text: str, key: str | None, parse_mode: str = "auto",
+                 silent: bool = False) -> None:
+        self._pending_send.append({"text": text, "key": key, "parse_mode": parse_mode,
+                                   "silent": silent})
         self._persist_queue()
 
     def _send_final(self, text: str, key: str | None = None,
-                    parse_mode: str = "auto") -> None:
+                    parse_mode: str = "auto", silent: bool = False) -> None:
         """Forward one reply RELIABLY. Marks the dedup ledger only AFTER a confirmed send; on any
         send failure the reply is queued to disk and the outbound loop keeps retrying until Telegram
         confirms. Order is preserved: if anything is already queued, this appends behind it.
@@ -449,10 +453,10 @@ class AttachBridge:
         if key and key in self._sent_keys:
             return
         if self._pending_send:                       # something already waiting → keep FIFO order
-            self._enqueue(text, key, parse_mode)
+            self._enqueue(text, key, parse_mode, silent)
             return
         try:
-            self.tg.send_message(self._owner_chat, text, parse_mode=parse_mode)
+            self.tg.send_message(self._owner_chat, text, parse_mode=parse_mode, silent=silent)
         except Exception as e:                        # network reset, 5xx after retries, etc.
             log.warning("forward failed → queued for re-delivery: %s", e)
             self._enqueue(text, key)
@@ -469,7 +473,8 @@ class AttachBridge:
             item = self._pending_send[0]
             try:
                 self.tg.send_message(self._owner_chat, item.get("text", ""),
-                                     parse_mode=item.get("parse_mode", "auto"))
+                                     parse_mode=item.get("parse_mode", "auto"),
+                                     silent=bool(item.get("silent")))
             except Exception as e:
                 log.warning("re-delivery still failing (%d queued): %s", len(self._pending_send), e)
                 return
@@ -861,7 +866,9 @@ class AttachBridge:
             return
         body = f"<i>{html.escape(line)}</i>"
         if self._status["mid"] is None:
-            mid = self.tg.send_plain_id(self._owner_chat, body, parse_mode="HTML")
+            # Always silent: the bubble is pure progress, and it is re-created every time it
+            # trails below new content — one buzz per tool call otherwise.
+            mid = self.tg.send_plain_id(self._owner_chat, body, parse_mode="HTML", silent=True)
             if mid:
                 self._status["mid"] = mid
                 self._status["shown"] = line

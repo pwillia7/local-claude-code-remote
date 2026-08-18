@@ -175,7 +175,8 @@ def _skill_source() -> Path:
 def render_skill(dest: Path, *, skill_name: str, label: str, python: str,
                  config: str = "", permissions: bool = True,
                  permission_timeout: float = core.PERMISSION_TIMEOUT,
-                 question_timeout: float = core.QUESTION_TIMEOUT) -> list[str]:
+                 question_timeout: float = core.QUESTION_TIMEOUT,
+                 loud: bool = False) -> list[str]:
     """Materialize the Skill with this machine's paths. Returns the files written."""
     src = _skill_source()
     config_arg = f" \\\n    --config {shlex.quote(config)}" if config else ""
@@ -183,6 +184,8 @@ def render_skill(dest: Path, *, skill_name: str, label: str, python: str,
                  f" \\\n    --question-timeout {question_timeout:g}")
     if not permissions:
         perm_args += " \\\n    --no-permission-prompts"
+    if loud:
+        perm_args += " \\\n    --loud"
     subs = {
         "{{SKILL_NAME}}": skill_name,
         "{{LABEL}}": label,
@@ -253,8 +256,12 @@ def install(args) -> int:
         written = render_skill(skill_dir, skill_name=skill_name, label=label,
                                python=python, config=str(cfg_path),
                                permissions=permissions, permission_timeout=permission_timeout,
-                               question_timeout=question_timeout)
+                               question_timeout=question_timeout,
+                               loud=bool(getattr(args, "loud", False)))
         changes.append(f"installed Skill → {skill_dir} ({len(written)} files)")
+    changes.append("notifications: "
+                   + ("every message (loud)" if getattr(args, "loud", False) else
+                      "progress silent; pings for a decision, a failure or the end of a turn"))
     changes.append("remote decisions: "
                    + (f"on — permissions wait {permission_timeout:g}s, questions "
                       f"{question_timeout:g}s, then the terminal takes over"

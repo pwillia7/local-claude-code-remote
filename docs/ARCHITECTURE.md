@@ -379,6 +379,14 @@ returns nothing the only cost is a missing digest. The window is deliberately ge
 real session's tail is mostly `tool_use`/`tool_result` records with no text — 256 KB of a
 tool-heavy transcript yielded a single lonely turn in testing, where 1 MB yielded the full six.
 
+**Why progress is delivered silently.** Telegram fires a notification for every *new* message
+and none for an edit, so streaming costs one buzz per assistant message rather than per delta —
+which is still a dozen buzzes on a long turn. Suppressing the notification (`disable_notification`)
+rather than suppressing the *message* keeps the chat a complete transcript, which is the whole
+point of a mirror; only the sound is conditional. The end-of-turn ping exists because the last
+streamed message was already delivered silently, and Telegram offers no way to notify
+retroactively for a message that is already sent.
+
 **Why origin defaults to `terminal`.** A session becomes Telegram-driven only when a prefixed
 prompt actually arrives. Anything else — including events before the first prompt — belongs to
 the local seat, which is what the user asked to mirror.

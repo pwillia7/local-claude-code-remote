@@ -152,7 +152,8 @@ def cmd_toggle(args) -> int:
                       permission_timeout=getattr(args, "permission_timeout",
                                                  core.PERMISSION_TIMEOUT),
                       question_timeout=getattr(args, "question_timeout",
-                                               core.QUESTION_TIMEOUT))
+                                               core.QUESTION_TIMEOUT),
+                      quiet=not getattr(args, "loud", False))
     # Connecting mid-session otherwise drops the phone into a stream with no context.
     if not getattr(args, "no_recap", False):
         try:
@@ -164,6 +165,8 @@ def cmd_toggle(args) -> int:
             pass                            # a missing recap must never block connecting
     extra = ("\nPermissions and questions can be answered from here."
              if permissions else "\nPermissions and questions are notification-only.")
+    if not getattr(args, "loud", False):
+        extra += "\nProgress arrives silently; you'll only be pinged when it needs you or finishes."
     ok = _notify(cfg, f"🟢 **{args.label} connected**\n\n"
                       "Local activity will now be mirrored here." + extra)
     if warning:
@@ -186,7 +189,8 @@ def cmd_status(args) -> int:
               f"origin={core.get_origin(bridge, session_id)} "
               f"pending={core.pending_count(bridge)} "
               f"consumer={state} "
-              f"permissions={'remote' if binding.get('permissions', True) else 'notify-only'}")
+              f"permissions={'remote' if binding.get('permissions', True) else 'notify-only'} "
+              f"notify={'quiet' if binding.get('quiet', True) else 'loud'}")
         return 0
     root = Path(core.sessions_dir())
     rows = sorted(root.glob("*.json")) if root.is_dir() else []
@@ -252,6 +256,10 @@ def add_parser(sub) -> None:
                        help="do not start the Agent2Telegram bridge if it is not running")
         p.add_argument("--no-recap", action="store_true",
                        help="do not send a digest of the conversation so far on connect")
+        p.add_argument("--loud", action="store_true",
+                       help="notify for every mirrored message. The default delivers progress "
+                            "silently and only notifies for a permission, a question, a failure "
+                            "or the end of a turn")
         return p
 
     _common(rcs.add_parser("toggle", help="turn mirroring on or off for one session"))
@@ -282,6 +290,9 @@ def add_parser(sub) -> None:
     ins.add_argument("--question-timeout", type=float, default=core.QUESTION_TIMEOUT,
                      help="seconds a question waits for a remote answer "
                           f"(default: {core.QUESTION_TIMEOUT:.0f})")
+    ins.add_argument("--loud", action="store_true",
+                     help="notify for every mirrored message instead of only for decisions "
+                          "and the end of a turn")
     ins.add_argument("--dry-run", action="store_true", help="report changes without making them")
 
     un = rcs.add_parser("uninstall", help="remove this project's hooks, Skill and state")

@@ -211,11 +211,15 @@ class TelegramClient:
         raise TelegramError(f"download failed: {last}")
 
     def send_plain_id(self, chat_id: int, text: str, *, parse_mode: str | None = None,
-                      reply_markup: dict | None = None) -> int | None:
+                      reply_markup: dict | None = None, silent: bool = False) -> int | None:
         """Send a message and return its message_id (for editable status bubbles).
 
-        ``reply_markup`` attaches an inline keyboard — used for the remote permission prompt."""
+        ``reply_markup`` attaches an inline keyboard — used for the remote permission prompt.
+        ``silent`` delivers it with no sound or vibration; it still arrives and still appears in
+        the chat, so history stays complete."""
         params = {"chat_id": chat_id, "text": text, "disable_web_page_preview": "true"}
+        if silent:
+            params["disable_notification"] = "true"
         if parse_mode:
             params["parse_mode"] = parse_mode
         if reply_markup is not None:
@@ -264,12 +268,18 @@ class TelegramClient:
         except TelegramError:
             pass  # purely cosmetic; never let it break a turn
 
-    def send_message(self, chat_id: int, text: str, *, parse_mode: str = "auto") -> None:
+    def send_message(self, chat_id: int, text: str, *, parse_mode: str = "auto",
+                     silent: bool = False) -> None:
         """Send text, splitting to Telegram's size limit. By default (``parse_mode="auto"``)
         the agent's Markdown is rendered via HTML; on any parse failure we fall back to plain
-        text so a message is never lost to a formatting glitch."""
+        text so a message is never lost to a formatting glitch.
+
+        ``silent`` suppresses the recipient's sound/vibration only — the message is delivered
+        and kept exactly as a normal one."""
         for chunk in split_message(text) or ["(empty response)"]:
             base = {"chat_id": chat_id, "disable_web_page_preview": "true"}
+            if silent:
+                base["disable_notification"] = "true"
             if parse_mode == "auto":
                 try:
                     self._call("sendMessage", {**base, "text": markdown_to_html(chunk), "parse_mode": "HTML"}, timeout=SEND_TIMEOUT)

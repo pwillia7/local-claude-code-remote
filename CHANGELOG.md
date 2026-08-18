@@ -22,6 +22,16 @@ The unit tests did not catch any of this because they fabricated payloads with t
 key. Field names are now asserted against payloads captured from a live Claude Code run.
 
 
+### Quiet by default
+
+Telegram notifies once per new message and never for an edit, so a twelve-message turn meant
+twelve buzzes. Progress (prompt echo, streamed text, tool bubble, recap, compaction) is now sent
+with `disable_notification` — delivered and kept in the history, just silent — while permission
+cards, questions, elicitations, failures, actionable notifications and one end-of-turn line still
+notify. The end-of-turn line previews the answer so a lock screen shows something useful, and is
+skipped when the turn had no output or when the whole answer was delivered at the end anyway.
+`--loud` restores the old behaviour.
+
 ### Hook-based local Remote Control
 
 The core of the fork. Native Claude Code Remote Control is disabled whenever `ANTHROPIC_BASE_URL`

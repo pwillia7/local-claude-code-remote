@@ -217,7 +217,8 @@ def _read_json(path: str):
 def bind_session(session_id: str, *, bridge: str, config_path: str = "",
                  origins=(), label: str = "", permissions: bool = True,
                  permission_timeout: float = PERMISSION_TIMEOUT,
-                 question_timeout: float = QUESTION_TIMEOUT, cwd: str = "") -> None:
+                 question_timeout: float = QUESTION_TIMEOUT, cwd: str = "",
+                 quiet: bool = True) -> None:
     """Turn Remote Control ON for one Claude session.
 
     The binding file is the hook's fast path: one ``open()`` tells it whether this session is
@@ -234,6 +235,8 @@ def bind_session(session_id: str, *, bridge: str, config_path: str = "",
         "permissions": bool(permissions),
         "permission_timeout": float(permission_timeout),
         "question_timeout": float(question_timeout),
+        # Progress arrives without a sound; only a decision or the end of a turn notifies.
+        "quiet": bool(quiet),
         "since": time.time(),
     }, ensure_ascii=False))
 

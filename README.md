@@ -98,6 +98,9 @@ session through Agent2Telegram's existing attach mode, exactly as before.
   is ever auto-approved or auto-answered.
 * **The bridge starts itself.** Enabling mirroring launches the bridge if it isn't running —
   and refuses to start a second one, because Telegram allows exactly one poller per bot.
+* **It doesn't buzz at you.** Progress is delivered silently — it arrives and stays in the chat,
+  it just makes no sound. You get a real notification only when it needs a decision, hits an
+  error, or finishes. `--loud` restores a ping per message.
 * **A blocked session never looks busy.** When Claude Code stops to ask, typing stops and the
   chat shows the question — with its options, ready to answer.
 * **Several sessions can share one bridge.** Each keeps its own streaming state, and messages
@@ -230,6 +233,24 @@ because this README is about the fork:
 Long replies are split at Telegram's 4096-character limit on paragraph, line or word boundaries;
 flood control (`429`), transient network errors and Markdown parse failures are all handled, and
 a reply whose send hard-fails is queued to disk and retried until Telegram confirms it.
+
+### Notifications
+
+A long turn is a lot of messages, and Telegram buzzes once per *new* message (edits never
+notify at all). Twelve assistant messages used to mean twelve buzzes, so the default now splits
+delivery from notification:
+
+| | |
+| --- | --- |
+| **silent** — arrives, no sound | your prompt echo, streamed assistant text, the tool bubble, the connect recap, compaction notices |
+| **notifies** | a permission card, a question, an MCP elicitation, a turn failure, an actionable notification, and one line when the turn ends |
+
+Nothing is withheld — the chat history is identical either way, this only controls the sound.
+The end-of-turn line previews the answer (`✅ Done — All 22 detector tests pass`) so the lock
+screen is useful, and it is skipped when the turn produced no output or when the full answer was
+delivered at the end anyway.
+
+Pass `--loud` at install or connect time to go back to a notification per message.
 
 ### Connecting mid-session
 

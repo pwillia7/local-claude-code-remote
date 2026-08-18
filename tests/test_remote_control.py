@@ -381,6 +381,9 @@ class _FakeChat:
         self.active: list[bool] = []
         self.keyboards: dict[int, dict] = {}
         self.parse_modes: list = []
+        self.silent: list = []          # was each delivery notification-suppressed?
+        self.quiet_sends: list = []
+        self.loud_sends: list = []
         self.answered: list = []
         self.cleared = 0
         self._next = 100
@@ -388,11 +391,12 @@ class _FakeChat:
         self.reject_html = False        # simulate Telegram refusing a parse_mode=HTML payload
 
     # streaming primitives
-    def send_plain_id(self, text: str, parse_mode=None, reply_markup=None):
+    def send_plain_id(self, text: str, parse_mode=None, reply_markup=None, silent=False):
         if self.fail_send:
             return None
         if self.reject_html and parse_mode == "HTML":
             return None
+        self.silent.append(bool(silent))
         self._next += 1
         self.messages[self._next] = text
         self.order.append(self._next)
@@ -414,8 +418,10 @@ class _FakeChat:
         self.answered.append((callback_id, text))
 
     # durable send / bubble / typing
-    def send_text(self, text: str, parse_mode: str = "auto") -> None:
+    def send_text(self, text: str, parse_mode: str = "auto", silent: bool = False) -> None:
         self.sent_text.append(text)
+        self.silent.append(bool(silent))
+        (self.quiet_sends if silent else self.loud_sends).append(text)
 
     def status_push(self, line: str) -> None:
         self.status.append(line)
@@ -585,8 +591,10 @@ class MirrorTests(_StateCase):
         self.display("m1", "The importer is fine.", final=True)
         self.hook("Stop", last_assistant_message="The importer is fine.")
         self.mirror.tick()
-        self.assertEqual(self.chat.stream(), ["The importer is fine."])
-        self.assertEqual(self.chat.sent_text, [])       # no "finished" duplicate
+        self.assertEqual(self.chat.stream(), rendered("The importer is fine."))
+        # One short completion ping, NOT a second copy of the answer.
+        self.assertEqual(len(self.chat.sent_text), 1)
+        self.assertTrue(self.chat.sent_text[0].startswith("✅ Done"))
 
     def test_stop_backstop_fires_only_when_nothing_was_streamed(self):
         self.hook("Stop", last_assistant_message="Only answer")
@@ -603,14 +611,17 @@ class MirrorTests(_StateCase):
         self.display("m2", "streamed", final=True)
         self.hook("Stop", last_assistant_message="streamed")
         self.mirror.tick()
-        self.assertEqual(len(self.chat.sent_text), 2)   # streamed turn adds nothing
+        # The streamed turn adds a completion ping, never a second copy of the answer.
+        self.assertEqual(len(self.chat.sent_text), 3)
+        self.assertTrue(self.chat.sent_text[2].startswith("✅ Done"))
 
     def test_stop_finalizes_a_message_left_open(self):
         self.display("m1", "half written")
         self.hook("Stop", last_assistant_message="half written")
         self.mirror.tick()
-        self.assertEqual(self.chat.stream(), ["half written"])
-        self.assertEqual(self.chat.sent_text, [])
+        self.assertEqual(self.chat.stream(), rendered("half written"))
+        self.assertEqual(len(self.chat.sent_text), 1)              # the ping only
+        self.assertTrue(self.chat.sent_text[0].startswith("✅ Done"))
 
     def test_idle_turn_is_ended_so_typing_cannot_hang(self):
         self.display("m1", "working…")
@@ -887,6 +898,89 @@ class MarkdownTests(_StateCase):
         self.mirror.tick()
         for chunk in self.chat.stream():
             self.assertLessEqual(len(chunk), MAX_MESSAGE_LEN)   # &amp; expansion included
+
+
+# --------------------------------------------------------------------------- notifications
+
+class NotificationPolicyTests(_StateCase):
+    """All the messages, but only buzz when it needs you or it's finished.
+
+    Telegram notifies once per NEW message and never for an edit, so a twelve-message turn
+    means twelve buzzes. Progress is therefore delivered with `disable_notification`: it still
+    arrives and still stays in the history, it just doesn't make a sound.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.chat = _FakeChat()
+        self.mirror = _mirror_for(self.chat)
+        self._interval = mirror_mod.EDIT_INTERVAL
+        mirror_mod.EDIT_INTERVAL = 0.0
+        self.addCleanup(setattr, mirror_mod, "EDIT_INTERVAL", self._interval)
+        self.enable()
+
+    def display(self, mid, delta, final=False):
+        self.hook("MessageDisplay", message_id=mid, turn_id="t", index=0,
+                  delta=delta, final=final)
+
+    def test_progress_is_delivered_but_silent(self):
+        self.hook("UserPromptSubmit", prompt="do the thing")
+        self.display("m1", "working on it", final=True)
+        self.mirror.tick()
+        self.assertEqual(self.chat.quiet_sends, ["🖥️ You:\ndo the thing"])   # delivered
+        self.assertEqual(self.chat.loud_sends, [])                            # but no buzz
+        self.assertTrue(all(self.chat.silent))                                # incl. the stream
+
+    def test_a_long_turn_buzzes_exactly_once(self):
+        self.hook("UserPromptSubmit", prompt="big job")
+        for i in range(12):
+            self.display(f"m{i}", f"step {i}", final=True)
+            self.hook("PreToolUse", tool_name="Read", tool_input={"file_path": f"/x/{i}.ts"})
+        self.mirror.tick()
+        self.assertEqual(self.chat.loud_sends, [])          # twelve messages, no buzz yet
+        self.hook("Stop", last_assistant_message="all done")
+        self.mirror.tick()
+        self.assertEqual(len(self.chat.loud_sends), 1)      # exactly one, at the end
+        self.assertIn("all done", self.chat.loud_sends[0])  # and useful on a lock screen
+
+    def test_the_things_that_need_you_always_notify(self):
+        core.touch_heartbeat(BRIDGE)
+        core.write_event(BRIDGE, {"type": "permission_request", "session_id": SID,
+                                  "request_id": "r1", "tool_name": "Bash", "summary": "x"})
+        self.mirror.tick()
+        self.assertFalse(self.chat.silent[-1])              # the approval card buzzes
+        self.hook("StopFailure", error="Overloaded")
+        self.mirror.tick()
+        self.assertIn("Overloaded", self.chat.loud_sends[-1])
+
+    def test_an_actionable_notification_is_loud(self):
+        self.hook("Notification", notification_type="idle_prompt")
+        self.mirror.tick()
+        self.assertEqual(len(self.chat.loud_sends), 1)
+
+    def test_no_ping_for_a_turn_that_never_started(self):
+        self.hook("Stop", last_assistant_message="")
+        self.mirror.tick()
+        self.assertEqual(self.chat.sent_text, [])
+
+    def test_the_backstop_answer_is_itself_the_notification(self):
+        self.hook("Stop", last_assistant_message="the whole answer")
+        self.mirror.tick()
+        self.assertEqual(len(self.chat.loud_sends), 1)
+        self.assertIn("the whole answer", self.chat.loud_sends[0])
+        self.assertEqual(len(self.chat.sent_text), 1)       # answer only, no extra ping
+
+    def test_loud_mode_notifies_for_everything(self):
+        core.bind_session(SID, bridge=BRIDGE, quiet=False)
+        self.hook("UserPromptSubmit", prompt="do it")
+        self.display("m1", "working", final=True)
+        self.mirror.tick()
+        self.assertTrue(self.chat.loud_sends)
+        self.assertNotIn(True, self.chat.silent)
+        self.hook("Stop", last_assistant_message="done")
+        self.mirror.tick()
+        # Loud mode already buzzed on every message, so it adds no completion ping.
+        self.assertFalse(any(t.startswith("✅ Done") for t in self.chat.sent_text))
 
 
 # --------------------------------------------------------------------------- spool

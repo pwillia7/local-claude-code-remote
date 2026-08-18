@@ -17,6 +17,13 @@ Streaming model (mirrors Claude Code's ``MessageDisplay`` events):
 Text is rendered from the agent's Markdown to Telegram HTML, with a plain-text fallback on any
 rejection, so formatting is never traded for content (see :func:`_render` and ``_write``).
 
+Notification policy: a long turn produces many messages, and Telegram buzzes once per *new*
+message (edits never notify). Progress — the prompt echo, streamed assistant text, the tool
+bubble, compaction notices — is therefore sent with ``disable_notification``, so it arrives and
+stays in the history but stays quiet. Only the things you would actually want to look up for
+get a real notification: a permission card, a question, a failure, and one line when the turn
+finishes. That turns a twelve-buzz turn into one.
+
 State is **per Claude session**, not per bridge. One bridge can mirror several sessions at once,
 and mixing their streams — or letting one session's turn end finalize another's half-written
 message — is a correctness bug, not merely untidy output.
@@ -102,9 +109,10 @@ class _LiveMessage:
 class _Session:
     """Everything the mirror tracks for one Claude session."""
 
-    __slots__ = ("live", "order", "delivered", "working", "waiting", "tag")
+    __slots__ = ("live", "order", "delivered", "working", "waiting", "tag", "last_text")
 
     def __init__(self) -> None:
+        self.last_text = ""      # newest streamed text, previewed in the completion ping
         self.live: dict = {}     # message_id → _LiveMessage
         self.order: list = []
         self.delivered = False   # has this turn already put assistant text in the chat?
@@ -214,6 +222,15 @@ class RemoteControlMirror:
             or (session_id[:6] if session_id else "session")
         return f"[{core.short(tag, 24)}] "
 
+    def _quiet(self, sid: str) -> bool:
+        """Whether progress for this session should arrive without a notification."""
+        self._roster_size()                      # refreshes the cached roster
+        return bool(self._roster.get(sid, {}).get("quiet", True))
+
+    def _progress(self, sid: str, text: str, parse_mode="auto") -> None:
+        """Deliver progress: always sent, notified only if this session asked to be loud."""
+        self._send_text(text, parse_mode=parse_mode, silent=self._quiet(sid))
+
     def _refresh_typing(self) -> None:
         """Typing is on while any session is working and none of its dialogs are blocking."""
         want = any(s.working and not s.waiting for s in self._sessions.values())
@@ -303,7 +320,7 @@ class RemoteControlMirror:
         self._working(sid, True)
         if text:
             # Plain text: a local prompt is arbitrary content and must never be re-parsed.
-            self._send_text(self._prefix(sid) + "🖥️ You:\n" + text, parse_mode=None)
+            self._progress(sid, self._prefix(sid) + "🖥️ You:\n" + text, parse_mode=None)
 
     def _on_recap(self, ev: dict, sid: str) -> None:
         """Connecting mid-session otherwise drops you into a stream with no context."""
@@ -311,7 +328,7 @@ class RemoteControlMirror:
         if ev.get("cwd"):
             self._session(sid).tag = _basename(ev["cwd"])
         if text:
-            self._send_text("📜 Where this session is up to:\n\n" + text, parse_mode=None)
+            self._progress(sid, "📜 Where this session is up to:\n\n" + text, parse_mode=None)
 
     def _on_notification(self, ev: dict, sid: str) -> None:
         texts = {
@@ -325,10 +342,10 @@ class RemoteControlMirror:
 
     def _on_compact_end(self, ev: dict, sid: str) -> None:
         self._status_clear()
-        self._send_text(self._prefix(sid)
-                        + f"🗜️ Conversation compacted ({ev.get('trigger') or '?'}). "
-                          "Earlier context was summarized; the session continues.",
-                        parse_mode=None)
+        self._progress(sid, self._prefix(sid)
+                       + f"🗜️ Conversation compacted ({ev.get('trigger') or '?'}). "
+                         "Earlier context was summarized; the session continues.",
+                       parse_mode=None)
 
     def _on_interrupted(self, ev: dict, sid: str) -> None:
         """Interrupted from Telegram — Claude Code sends no Stop or StopFailure for that.
@@ -511,7 +528,7 @@ class RemoteControlMirror:
         if key in state.waiting:
             return
         self._status_clear()               # the question must be the last thing in the chat
-        mid = self._send_plain_id(self._prefix(sid) + text, parse_mode="HTML")
+        mid = self._send_plain_id(self._prefix(sid) + text, parse_mode="HTML")  # notifies
         state.waiting[key] = {"mid": mid}
         self._refresh_typing()             # stop "typing…": it is waiting, not working
         log.info("MIRROR (dialog) session blocked on a human answer")
@@ -636,15 +653,34 @@ class RemoteControlMirror:
     # ---- turn end ----------------------------------------------------------
     def _on_turn_end(self, ev: dict, sid: str) -> None:
         self._finalize_all(sid)
+        state = self._session(sid)
         # Backstop: if nothing reached the chat through MessageDisplay (hook not registered,
         # a mirror error, an answer rendered some other way), deliver the documented final
         # message. No transcript parsing, and never a second copy of streamed text.
-        if not self._session(sid).delivered:
+        if not state.delivered:
             answer = (ev.get("last_assistant_message") or "").strip()
             if answer:
+                # Loud: this IS both the answer and the "it's finished" notification.
                 self._send_text(self._prefix(sid) + "🖥️ " + answer)
                 log.info("remote-control: Stop backstop delivered the final answer")
+        elif state.working:
+            self._notify_done(sid, ev, state)
         self._end_turn(sid)
+
+    def _notify_done(self, sid: str, ev: dict, state: _Session) -> None:
+        """One notifying line at the end of a turn whose text arrived silently.
+
+        The answer is already in the chat, above this — but every message of it was delivered
+        without a sound, so without this the turn would finish with no notification at all.
+        The preview text makes it useful on a lock screen instead of a bare "done"."""
+        if not self._quiet(sid):
+            return                               # loud mode already notified on every message
+        preview = (ev.get("last_assistant_message") or state.last_text or "").strip()
+        preview = " ".join(preview.split())
+        if len(preview) > 160:
+            preview = preview[:159] + "…"
+        self._send_text(self._prefix(sid) + "✅ Done" + (f" — {preview}" if preview else ""),
+                        parse_mode=None)
 
     def _on_turn_failed(self, ev: dict, sid: str) -> None:
         self._finalize_all(sid)
@@ -741,9 +777,11 @@ class RemoteControlMirror:
         # rejects the rich version (or it would not fit), the same text goes out as plain.
         rendered = _render(body)
         if live.mid is None:
-            mid = self._send_plain_id(rendered, parse_mode="HTML") if rendered else None
+            quiet = self._quiet(sid)
+            mid = (self._send_plain_id(rendered, parse_mode="HTML", silent=quiet)
+                   if rendered else None)
             if mid is None:
-                mid = self._send_plain_id(body)
+                mid = self._send_plain_id(body, silent=quiet)
             if mid is None:
                 return                             # send failed; retry on the next flush
             live.mid = mid
@@ -755,7 +793,9 @@ class RemoteControlMirror:
                 return                             # leave `shown` alone so the next flush retries
         live.shown = text
         live.last_edit = time.monotonic()
-        self._session(sid).delivered = True
+        state = self._session(sid)
+        state.delivered = True
+        state.last_text = text
 
 
 def _auto_submits(questions: list) -> bool:
