@@ -217,7 +217,7 @@ Full event-by-event walkthrough: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 This repo ships an agent playbook. Copy it in, then ask:
 
 ```bash
-git clone https://github.com/<you>/local-claude-code-remote.git
+git clone https://github.com/pwillia7/local-claude-code-remote.git
 cd local-claude-code-remote
 mkdir -p "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills"
 cp -r skills/local-remote-setup "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/"
@@ -304,6 +304,44 @@ Exercised on Linux with Claude Code 2.1.x routed through CCR to a local Qwen mod
 and 3.14, and Agent2Telegram attach mode. Other gateways, models and platforms should work — the
 implementation only depends on documented hook events — but are untested, and this README does
 not claim more than has actually been run.
+
+## What it doesn't do
+
+It is worth being precise about this, because the pitch — "Remote Control for gateway-routed
+sessions" — invites the assumption that it is a drop-in replacement. It isn't.
+
+**Native does these; this doesn't:**
+
+* **Command output doesn't come back.** `/context`, `/usage`, `/compact` and friends *run* when
+  you send them, but their output is drawn in the terminal UI, not written to the transcript or
+  any hook. Reading it would mean scraping the pane, which this project deliberately never does —
+  so the chat confirms the command was sent, and the result stays on screen.
+* **`/resume` disconnects.** Native follows you into the conversation you switch to. Here a
+  resumed session starts disconnected, by the same rule as `startup` and `fork`; run the toggle
+  again in the resumed session.
+* **No session list, titles, `/rename`, session URL or QR code.** One bridge, one chat. Several
+  sessions can share it and get a `[project]` label, but there is nothing to browse or name.
+* **No `@` file autocomplete** when typing from the phone.
+* **No starting a session remotely.** Native server mode spawns sessions on demand, optionally
+  each in its own git worktree. Here you attach to a tmux seat that already exists.
+* **No presence suppression.** Native skips pushes while you are at the keyboard (via
+  `CLAUDE_CLIENT_PRESENCE_FILE`); every message here reaches your phone regardless.
+* **MCP elicitations are reported, not answerable** — unlike `AskUserQuestion`, they have no
+  decision channel, only a refusal.
+* **Files and images Claude produces arrive as text.** Inbound works (send photos, documents and
+  voice notes *to* the session); outbound attachments do not.
+* Cross-session messaging, Trusted Devices and organization policy controls: not applicable.
+
+**Deliberate, not missing:**
+
+* Only **terminal-originated** turns are mirrored. Telegram-originated ones keep upstream's
+  transcript path, which is what guarantees no answer is ever delivered twice.
+* A pending permission or question **holds the terminal prompt** while it waits for your phone.
+  That is the cost of answering remotely at all; both waits are bounded and configurable.
+* No terminal scraping, and no transcript on the live path.
+
+**Honestly untested:** whether extended thinking appears in `MessageDisplay` (so it may or may not
+be mirrored), and the `AskUserQuestion` inference noted under [Requirements](#requirements).
 
 ## Relationship to upstream
 

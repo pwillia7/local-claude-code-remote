@@ -3,6 +3,12 @@
 Agent2Telegram lets a Telegram user run a coding agent — which can execute commands — on
 the host machine. Security is therefore a first-class concern.
 
+> **This fork adds capabilities with their own security properties** — approving tool
+> permissions and answering the agent's questions from the chat, a spool that briefly holds
+> message content on disk, and a connect-time transcript digest. They are covered in
+> [`docs/SECURITY.md`](docs/SECURITY.md); read that alongside this. The policy below still
+> applies in full.
+
 ## Threat model & built-in protections
 - **Authorization:** only Telegram user ids in `allowed_user_ids` may drive the agent.
   Everyone else is refused. Keep this list to the device owner(s) only.
