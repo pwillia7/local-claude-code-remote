@@ -29,7 +29,9 @@ document covers what the Remote Control layer adds.
 This is the part of the design that changes what the Telegram side can *do*, so it deserves a
 clear statement.
 
-**What it grants.** An allow-listed Telegram user can press ✅ Allow and let a tool call run.
+**What it grants.** An allow-listed Telegram user can press ✅ Allow and let a tool call run, and
+can answer a question Claude asked — by tapping an option or by replying with free text, which is
+then handed to the model as their answer.
 
 **Why that is not an escalation.** That user can already send arbitrary prompts into a live
 Claude Code session, which is a strictly larger capability: they could simply ask for the same
@@ -43,6 +45,10 @@ all — see the trust model above.
   presser gets "Not authorized", the buttons stay live, and nothing is recorded.
 * A press is honoured **once**. The request is removed from the pending map under a lock before
   a decision is written, so a replayed or double press decides nothing.
+* A free-text answer is only accepted as a **reply to the specific question card**, so an ordinary
+  chat message can never be mistaken for an answer, and vice versa.
+* An answer is model-visible text. It is length-capped, and it is the user's own words — the
+  model is told to treat it as the answer, not as an instruction with any special authority.
 * Buttons are retracted when the request is answered, when it expires, and at turn end — a card
   never outlives the decision it was for.
 * An Allow press cannot loosen your settings: a hook `allow` does not override `deny` rules, and
@@ -51,8 +57,8 @@ all — see the trust model above.
   at the terminal. Timeouts never imply consent.
 * The bot token still never leaves the bridge process; the decision travels as a `0600` file on
   the local filesystem, not over the network.
-* Don't want it? `--no-permission-prompts` reverts to a notification, and `remote-control off`
-  ends it for that session.
+* Don't want it? `--no-permission-prompts` turns off **both** remote approvals and remote
+  answers, reverting to notifications, and `remote-control off` ends it for that session.
 
 **What the card shows.** The tool name, the one-line summary, and one redacted detail line
 (the Bash command, the file path, the URL, …). For MCP tools it names the argument *keys* only,
@@ -81,6 +87,14 @@ Mitigations:
 
 Redaction is a safety net for accidents, not a guarantee. Anyone with access to the Telegram
 account can read whatever the session displays — protect that account.
+
+## The keyboard lockout
+
+A permission request and a question both **block the hook** while they wait for the chat, and a
+blocked hook means the person at the keyboard cannot answer either — Claude Code holds the prompt
+until the hook returns. That is a real cost, not just a design note: the defaults are 90 s for a
+permission and 120 s for a question, both configurable, and both fall back to the terminal when
+they expire. Lower them if the machine is usually attended.
 
 ## Driving the session from Telegram
 

@@ -95,6 +95,10 @@ ACTIONABLE_NOTIFICATIONS = ("idle_prompt", "agent_needs_input", "agent_completed
 #: being spent — but it must stay short enough that someone sitting at the keyboard is not
 #: locked out of their own prompt for long.
 PERMISSION_TIMEOUT = 90.0
+#: The same wait, for a question Claude asks with its own picker. Longer than a permission
+#: because reading several options and choosing is a slower decision than allow/deny — but it is
+#: still a lockout for anyone sitting at the keyboard, so it stays bounded and configurable.
+QUESTION_TIMEOUT = 120.0
 #: Poll interval while waiting for the decision file (a few hundred stats over the whole wait).
 PERMISSION_POLL = 0.1
 #: An answered-but-never-collected decision (the hook died, Claude Code was killed) is swept
@@ -212,7 +216,8 @@ def _read_json(path: str):
 
 def bind_session(session_id: str, *, bridge: str, config_path: str = "",
                  origins=(), label: str = "", permissions: bool = True,
-                 permission_timeout: float = PERMISSION_TIMEOUT, cwd: str = "") -> None:
+                 permission_timeout: float = PERMISSION_TIMEOUT,
+                 question_timeout: float = QUESTION_TIMEOUT, cwd: str = "") -> None:
     """Turn Remote Control ON for one Claude session.
 
     The binding file is the hook's fast path: one ``open()`` tells it whether this session is
@@ -228,6 +233,7 @@ def bind_session(session_id: str, *, bridge: str, config_path: str = "",
         "cwd": cwd,
         "permissions": bool(permissions),
         "permission_timeout": float(permission_timeout),
+        "question_timeout": float(question_timeout),
         "since": time.time(),
     }, ensure_ascii=False))
 
@@ -368,10 +374,15 @@ def ack_event(path: str) -> None:
     _unlink(path)
 
 
-def write_decision(bridge: str, request_id: str, decision: str, by=None) -> None:
-    """Record a remote Allow/Deny. The waiting hook picks it up and deletes it."""
-    _write_private(decision_path(bridge, request_id), json.dumps(
-        {"decision": decision, "by": by, "ts": time.time()}, ensure_ascii=False))
+def write_decision(bridge: str, request_id: str, decision: str, by=None,
+                   answer: str = "") -> None:
+    """Record a remote decision — an Allow/Deny, or an answer to a question.
+
+    The waiting hook picks it up and deletes it."""
+    payload = {"decision": decision, "by": by, "ts": time.time()}
+    if answer:
+        payload["answer"] = answer
+    _write_private(decision_path(bridge, request_id), json.dumps(payload, ensure_ascii=False))
 
 
 def sweep_decisions(bridge: str, ttl: float = DECISION_TTL) -> int:
@@ -651,7 +662,8 @@ def _handle_session_end(payload: dict, binding: dict) -> None:
     unbind_session(session_id, bridge)
 
 
-def _await_decision(bridge: str, request_id: str, timeout: float):
+def _await_decision(bridge: str, request_id: str, timeout: float,
+                    valid=("allow", "deny")):
     """Block until the bridge records a decision for *request_id*, or until *timeout*.
 
     Polling a file is deliberate: the hook must never open a second Telegram connection — the
@@ -661,12 +673,62 @@ def _await_decision(bridge: str, request_id: str, timeout: float):
     deadline = time.monotonic() + max(0.0, timeout)
     while True:
         data = _read_json(path)
-        if isinstance(data, dict) and data.get("decision") in ("allow", "deny"):
+        if isinstance(data, dict) and data.get("decision") in valid:
             _unlink(path)
             return data
         if time.monotonic() >= deadline:
             return None
         time.sleep(PERMISSION_POLL)
+
+
+def _handle_question(payload: dict, binding: dict):
+    """Let the chat answer a question Claude asked with its own picker.
+
+    Claude Code has no hook output that supplies a tool *result*, so the answer cannot be handed
+    to ``AskUserQuestion`` directly. It can be carried back the documented way instead: block the
+    tool with ``permissionDecision: "deny"`` and put the user's choice in
+    ``permissionDecisionReason``, which Claude Code shows to the model, which then continues with
+    that choice. The question is never asked twice — the reason says so explicitly.
+
+    Every failure path returns None, which leaves the tool call alone and lets Claude Code show
+    its own picker at the terminal exactly as it would without this hook.
+    """
+    bridge = binding["bridge"]
+    session_id = payload.get("session_id", "")
+    summary = question_summary(payload.get("tool_input"))
+
+    if not binding.get("permissions", True) or not consumer_alive(bridge):
+        # Surface only: either remote decisions are off, or nobody is there to answer.
+        _emit(bridge, session_id, "question",
+              tool_use_id=payload.get("tool_use_id", ""),
+              tool_name=short(payload.get("tool_name", ""), 40), **summary)
+        return None
+    if not summary.get("questions"):
+        return None                                   # nothing recognizable to ask
+
+    request_id = os.urandom(8).hex()
+    timeout = float(binding.get("question_timeout") or QUESTION_TIMEOUT)
+    if not _emit(bridge, session_id, "question_request", request_id=request_id,
+                 tool_use_id=payload.get("tool_use_id", ""),
+                 tool_name=short(payload.get("tool_name", ""), 40),
+                 timeout=timeout, **summary):
+        return None                                   # spool full → fall back to the terminal
+
+    decision = _await_decision(bridge, request_id, timeout, valid=("answer",))
+    if decision is None:
+        _emit(bridge, session_id, "question_expired", request_id=request_id)
+        return None
+
+    answer = short(str(decision.get("answer") or "").strip(), 800)
+    if not answer:
+        return None
+    return {"hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "deny",
+        "permissionDecisionReason": (
+            f"The user answered this question from Telegram: {answer}. "
+            "Treat that as their answer, continue with it, and do not ask again."),
+    }}
 
 
 def _handle_permission(payload: dict, binding: dict):
@@ -753,11 +815,10 @@ def handle(payload: dict):
     elif event == "PreToolUse":
         tool = payload.get("tool_name", "")
         if tool in BLOCKING_TOOLS:
-            # Claude Code stops here until a human answers, and emits no turn end. Say so, or
-            # the chat shows a session that looks busy forever.
-            _emit(bridge, session_id, "question",
-                  tool_use_id=payload.get("tool_use_id", ""), tool_name=short(tool, 40),
-                  **question_summary(payload.get("tool_input")))
+            # Claude Code stops here until a human answers, and emits no turn end. Ask the chat
+            # to answer it; if that isn't possible, say what it is waiting for, or the chat
+            # shows a session that looks busy forever.
+            return _handle_question(payload, binding)
         else:
             _emit(bridge, session_id, "tool",
                   summary=tool_summary(tool, payload.get("tool_input")),

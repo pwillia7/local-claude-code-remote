@@ -149,7 +149,9 @@ def cmd_toggle(args) -> int:
                       origins=_origins(cfg), label=args.label, cwd=cwd,
                       permissions=permissions,
                       permission_timeout=getattr(args, "permission_timeout",
-                                                 core.PERMISSION_TIMEOUT))
+                                                 core.PERMISSION_TIMEOUT),
+                      question_timeout=getattr(args, "question_timeout",
+                                               core.QUESTION_TIMEOUT))
     # Connecting mid-session otherwise drops the phone into a stream with no context.
     if not getattr(args, "no_recap", False):
         try:
@@ -159,8 +161,8 @@ def cmd_toggle(args) -> int:
                                           "text": text, "cwd": cwd})
         except Exception:
             pass                            # a missing recap must never block connecting
-    extra = ("\nPermission requests can be approved from here."
-             if permissions else "\nPermission requests are notification-only.")
+    extra = ("\nPermissions and questions can be answered from here."
+             if permissions else "\nPermissions and questions are notification-only.")
     ok = _notify(cfg, f"🟢 **{args.label} connected**\n\n"
                       "Local activity will now be mirrored here." + extra)
     if warning:
@@ -236,8 +238,12 @@ def add_parser(sub) -> None:
         p.add_argument("--label", default=DEFAULT_LABEL,
                        help="user-facing name used in the connect/disconnect notices")
         p.add_argument("--no-permission-prompts", action="store_true",
-                       help="surface permission requests as a notice only, with no Allow/Deny "
-                            "buttons (decisions then happen at the terminal only)")
+                       help="turn OFF all remote decisions — permission Allow/Deny buttons and "
+                            "answering Claude's questions. Both are then reported only, and "
+                            "decided at the terminal.")
+        p.add_argument("--question-timeout", type=float, default=core.QUESTION_TIMEOUT,
+                       help="seconds to wait for a remote answer to a question before falling "
+                            f"back to the terminal picker (default: {core.QUESTION_TIMEOUT:.0f})")
         p.add_argument("--permission-timeout", type=float, default=core.PERMISSION_TIMEOUT,
                        help="seconds to wait for a remote Allow/Deny before falling back to "
                             f"the terminal prompt (default: {core.PERMISSION_TIMEOUT:.0f})")
@@ -271,6 +277,9 @@ def add_parser(sub) -> None:
     ins.add_argument("--permission-timeout", type=float, default=core.PERMISSION_TIMEOUT,
                      help="seconds a permission request waits for a remote answer "
                           f"(default: {core.PERMISSION_TIMEOUT:.0f})")
+    ins.add_argument("--question-timeout", type=float, default=core.QUESTION_TIMEOUT,
+                     help="seconds a question waits for a remote answer "
+                          f"(default: {core.QUESTION_TIMEOUT:.0f})")
     ins.add_argument("--dry-run", action="store_true", help="report changes without making them")
 
     un = rcs.add_parser("uninstall", help="remove this project's hooks, Skill and state")

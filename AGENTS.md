@@ -104,9 +104,10 @@ Extra hard rules for that layer:
    its imports cheap, and never do network I/O, subprocesses or transcript scanning. It also
    must have **no relative imports** — it is registered as a plain script run with
    `python3 -S -E`, which is what keeps start-up under ~20 ms.
-   The single exception is `PermissionRequest`, which waits on a local decision file: there
-   Claude Code is already stopped asking a human, so the wait costs nothing that was not being
-   spent anyway. Do not add a second waiting event.
+   The only waits are `PermissionRequest` and `PreToolUse(AskUserQuestion)`, which block on a
+   local decision file: in both, Claude Code is already stopped asking a human, so the wait costs
+   nothing that was not being spent anyway. `PreToolUse` must return immediately for every other
+   tool. Do not add a third waiting event.
 2. **Fail open.** Any error in mirroring exits 0. A broken mirror must never break Claude Code.
 3. **Never mirror a Telegram-originated turn.** `UserPromptSubmit` records the origin; the
    attach path already owns those turns and a second copy is a user-visible bug.

@@ -125,8 +125,13 @@ Two options worth knowing:
 * `--permission-timeout <seconds>` (default 90) — how long a permission request waits for an
   Allow/Deny press before the terminal prompt takes over. The `PermissionRequest` hook's own
   `timeout` in `settings.json` is set 30 s above it, so our graceful fallback always wins.
-* `--no-permission-prompts` — surface permission requests as a notice only, and decide at the
-  keyboard as before.
+* `--question-timeout <seconds>` (default 120) — the same, for a question Claude asks with its
+  own picker, which the chat can answer by tapping an option or replying with text.
+* `--no-permission-prompts` — turn off both remote approvals and remote answers; both are then
+  reported only, and decided at the keyboard.
+
+Both timeouts hold the terminal prompt while they wait, so pick them for how often you are
+actually at this machine.
 
 Verify:
 

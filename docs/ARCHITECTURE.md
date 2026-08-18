@@ -52,7 +52,7 @@ The hook side never talks to the network. The bridge side never reads a hook.
 | `SessionEnd` | Real exits (`logout`, `prompt_input_exit`, …) clean up. `clear`/`resume` deliberately do **not** — they are followed by a `SessionStart`. |
 | `UserPromptSubmit` | Classify the turn's origin from `user_input`, and mirror terminal prompts. |
 | `MessageDisplay` | Stream assistant text. |
-| `PreToolUse` | Tool status bubble — except for `AskUserQuestion`, which is a *blocking dialog*, not activity. |
+| `PreToolUse` | Tool status bubble — except for `AskUserQuestion`, which is a *blocking dialog* the chat can answer. |
 | `PostToolUse` | Registered with a matcher for blocking tools **only**: it tells us the human answered. `tool_output` is never read. |
 | `PostToolUseFailure` | Tool failure in the bubble. |
 | `PermissionRequest` | Ask the chat to decide (Allow/Deny buttons) and **block** on the answer; fall back to the terminal prompt if nobody presses one. |
@@ -190,9 +190,34 @@ PostToolUse(AskUserQuestion) → spool {question_answered}
 turn end / interrupt         → any dialog still open is closed as "answered at the terminal"
 ```
 
-The card cannot be answered from Telegram: the documented hook output for `PermissionRequest` is
-a `decision`, and there is no equivalent for supplying an *answer*. Rather than fake one with
-tmux keystrokes against a picker, the card reports the question and points at the keyboard.
+Unlike a permission, a question has no decision channel of its own — Claude Code has **no hook
+output that supplies a tool result**, so the answer cannot be handed to `AskUserQuestion`
+directly. It rides back on the one documented channel that does reach the model:
+
+```
+PreToolUse(AskUserQuestion) → block on decisions/<id>.json, as permissions do
+   press / reply           → {"decision":"answer","answer":"Approach: Rewrite"}
+   hook returns            → {"hookSpecificOutput":{
+                                "hookEventName":"PreToolUse",
+                                "permissionDecision":"deny",
+                                "permissionDecisionReason":
+                                  "The user answered this question from Telegram: … .
+                                   Treat that as their answer, continue with it,
+                                   and do not ask again."}}
+```
+
+`deny` here is not a refusal, it is a short-circuit: the docs specify that
+`permissionDecisionReason` is shown to the model and the model continues. Wording it as an answer
+plus "do not ask again" is what keeps it from simply re-asking.
+
+The card itself is one button per option. A single-choice question submits on the first tap; a
+multi-select toggles and waits for **📨 Send answer**; several questions in one ask are collected
+before submitting; and a free-text **reply** to the card is taken as the answer, which is the
+remote equivalent of typing your own option. If nobody answers within `question_timeout`, the
+hook returns nothing and Claude Code shows its own picker — the same fallback as everywhere else.
+
+MCP elicitations are reported but not answerable: `Elicitation` can only block via exit 2, which
+is a refusal, not an answer.
 
 ### 6. Interrupting from Telegram
 

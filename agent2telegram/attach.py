@@ -537,6 +537,13 @@ class AttachBridge:
             self.tg.send_message(chat_id, "⛔ Not authorized.")
             return
 
+        # A reply to a pending question card IS the answer to that question — not a new prompt.
+        reply_to = (msg.get("reply_to_message") or {}).get("message_id")
+        if reply_to is not None and self._remote is not None and msg.get("text"):
+            if self._remote.answer_question_reply(reply_to, msg["text"]):
+                self.tg.send_message(chat_id, "✅ Answer sent to the session.")
+                return
+
         # Bridge-level slash commands (e.g. /start, /help) are answered here instead of being
         # forwarded to the agent — so the first contact is a friendly intro, not the agent
         # puzzling over "/start". Only plain-text commands, never media captions.

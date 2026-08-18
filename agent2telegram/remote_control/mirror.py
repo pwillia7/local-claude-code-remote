@@ -141,6 +141,9 @@ class RemoteControlMirror:
         # a card is posted) AND by its inbound thread (when the press arrives), so it is locked.
         self._pending_perms: dict = {}
         self._perm_lock = threading.Lock()
+        # Question cards awaiting an answer, same two-thread situation as the permission cards.
+        self._pending_questions: dict = {}
+        self._q_lock = threading.Lock()
 
     # ---- lifecycle ---------------------------------------------------------
     def tick(self) -> int:
@@ -253,6 +256,11 @@ class RemoteControlMirror:
                               + "✅ Task completed: " + core.short(ev.get("task_name", ""), 60))
         elif kind == "question":
             self._on_question(ev, sid)
+        elif kind == "question_request":
+            self._on_question_request(ev, sid)
+        elif kind == "question_expired":
+            self._resolve_question(ev.get("request_id", ""),
+                                   "⌛ <b>Expired</b> — answer it at the terminal.")
         elif kind == "question_answered":
             self._resolve_dialog(sid, ev.get("tool_use_id", ""),
                                  "✅ <b>Answered at the terminal</b>")
@@ -354,6 +362,139 @@ class RemoteControlMirror:
         lines += ["", "<i>Answer it at the terminal — this one can't be answered from here.</i>"]
         self._open_dialog(sid, ev.get("tool_use_id", ""), "\n".join(lines))
 
+    def _on_question_request(self, ev: dict, sid: str) -> None:
+        """Post an answerable question card; the PreToolUse hook is blocked waiting on it."""
+        request_id = ev.get("request_id", "")
+        questions = ev.get("questions") or []
+        if not request_id or not questions:
+            return
+        self._status_clear()               # the question must be the last thing in the chat
+        pending = {"questions": questions, "selections": {}, "session": sid,
+                   "mid": None, "ts": time.monotonic()}
+        mid = self._send_plain_id(self._question_card(sid, pending), parse_mode="HTML",
+                                  reply_markup=self._question_keyboard(request_id, pending))
+        if mid is None:
+            log.warning("remote-control: could not post the question card; "
+                        "the terminal picker will handle it")
+            return
+        pending["mid"] = mid
+        with self._q_lock:
+            self._pending_questions[request_id] = pending
+        # Register it as a blocking dialog too, so "typing…" stops: the session is waiting.
+        self._session(sid).waiting[f"q:{request_id}"] = {"mid": None}
+        self._refresh_typing()
+        log.info("MIRROR (question) card %s, %d question(s)", mid, len(questions))
+
+    def _question_card(self, sid: str, pending: dict) -> str:
+        lines = [f"{html.escape(self._prefix(sid))}❓ <b>Waiting for your answer</b>"]
+        for qi, q in enumerate(pending["questions"]):
+            chosen = pending["selections"].get(qi, [])
+            lines.append("")
+            if q.get("header"):
+                lines.append(f"<b>{html.escape(q['header'])}</b>")
+            if q.get("question"):
+                lines.append(html.escape(q["question"]))
+            for oi, option in enumerate(q.get("options") or []):
+                mark = "✅ " if oi in chosen else "• "
+                lines.append(f"  {mark}{html.escape(option)}")
+        lines += ["", "<i>Tap an option, or reply to this message with your own answer.</i>"]
+        return "\n".join(lines)
+
+    @staticmethod
+    def _question_keyboard(request_id: str, pending: dict) -> dict:
+        rows = []
+        for qi, q in enumerate(pending["questions"]):
+            chosen = pending["selections"].get(qi, [])
+            for oi, option in enumerate(q.get("options") or []):
+                mark = "✅ " if oi in chosen else ""
+                rows.append([{"text": mark + core.short(option, 30),
+                              "callback_data": f"q:{request_id}:{qi}:{oi}"}])
+        if not _auto_submits(pending["questions"]):
+            rows.append([{"text": "📨 Send answer", "callback_data": f"q:{request_id}:s:s"}])
+        return {"inline_keyboard": rows}
+
+    def _handle_question_press(self, query: dict, request_id: str, qi: str, oi: str) -> None:
+        with self._q_lock:
+            pending = self._pending_questions.get(request_id)
+        if pending is None:
+            self._answer_callback(query, "That question is no longer waiting.")
+            return
+        if qi == "s":
+            self._submit_question(query, request_id, pending)
+            return
+        try:
+            qi_i, oi_i = int(qi), int(oi)
+            question = pending["questions"][qi_i]
+        except (ValueError, IndexError):
+            return
+        chosen = pending["selections"].setdefault(qi_i, [])
+        if question.get("multi"):
+            chosen.remove(oi_i) if oi_i in chosen else chosen.append(oi_i)
+        else:
+            pending["selections"][qi_i] = [oi_i]
+        if _auto_submits(pending["questions"]):
+            self._submit_question(query, request_id, pending)
+            return
+        # Reflect the selection and keep waiting for the rest.
+        self._answer_callback(query, "Selected")
+        self._edit_plain(pending["mid"],
+                         self._question_card(pending["session"], pending), parse_mode="HTML",
+                         reply_markup=self._question_keyboard(request_id, pending))
+
+    def _submit_question(self, query, request_id: str, pending: dict) -> None:
+        answer = _format_answer(pending)
+        if not answer:
+            self._answer_callback(query, "Choose an option first.")
+            return
+        self._deliver_answer(request_id, pending, answer)
+        if query is not None:
+            self._answer_callback(query, "Sent ✅")
+
+    def _deliver_answer(self, request_id: str, pending: dict, answer: str) -> None:
+        """Hand the answer to the waiting hook and close the card."""
+        with self._q_lock:
+            self._pending_questions.pop(request_id, None)
+        core.write_decision(self.bridge, request_id, "answer", by=None, answer=answer)
+        self._edit_plain(pending["mid"],
+                         "✅ <b>Answered</b>\n\n" + html.escape(answer),
+                         parse_mode="HTML", reply_markup=NO_KEYBOARD)
+        sid = pending.get("session", "")
+        self._session(sid).waiting.pop(f"q:{request_id}", None)
+        self._refresh_typing()
+        log.info("remote-control: question %s answered from Telegram", request_id[:8])
+
+    def answer_question_reply(self, reply_to_mid: int, text: str) -> bool:
+        """A free-text reply to a question card is the answer. Runs on the INBOUND thread.
+
+        Returns True when it was consumed, so the bridge does not also inject it as a prompt.
+        Authorization is the caller's job — it already checked the allow-list."""
+        text = (text or "").strip()
+        if not text:
+            return False
+        with self._q_lock:
+            match = next(((rid, p) for rid, p in self._pending_questions.items()
+                          if p.get("mid") == reply_to_mid), None)
+        if match is None:
+            return False
+        request_id, pending = match
+        self._deliver_answer(request_id, pending, text)
+        return True
+
+    def _resolve_question(self, request_id: str, header: str) -> None:
+        with self._q_lock:
+            pending = self._pending_questions.pop(request_id, None)
+        if pending is None:
+            return
+        self._edit_plain(pending["mid"], header, parse_mode="HTML", reply_markup=NO_KEYBOARD)
+        self._session(pending.get("session", "")).waiting.pop(f"q:{request_id}", None)
+        self._refresh_typing()
+
+    def _resolve_session_questions(self, sid: str, header: str) -> None:
+        with self._q_lock:
+            ids = [rid for rid, p in self._pending_questions.items() if p.get("session") == sid]
+        for request_id in ids:
+            self._resolve_question(request_id, header)
+
     def _on_elicitation(self, ev: dict, sid: str) -> None:
         server = ev.get("server_name") or "an MCP server"
         body = [f"❓ <b>{html.escape(server)} is asking for input</b>"]
@@ -435,6 +576,14 @@ class RemoteControlMirror:
         Only allow-listed users are honoured — the same list that may drive the session at all.
         """
         data = (query.get("data") or "")
+        if data.startswith("q:"):
+            parts = data.split(":")
+            if len(parts) == 4 and (query.get("from") or {}).get("id") in set(allowed_ids or ()):
+                self._handle_question_press(query, parts[1], parts[2], parts[3])
+            elif len(parts) == 4:
+                self._answer_callback(query, "Not authorized.")
+                log.warning("remote-control: rejected a question press from an unknown user")
+            return True
         if not data.startswith("p:"):
             return False
         parts = data.split(":")
@@ -513,6 +662,7 @@ class RemoteControlMirror:
         # The turn is over, so any card still showing buttons was answered at the keyboard
         # (or abandoned). Leaving live buttons would let a later press decide nothing.
         self._resolve_session_permissions(sid, "🖥️ <b>Answered at the terminal</b>")
+        self._resolve_session_questions(sid, "🖥️ <b>Answered at the terminal</b>")
         self._resolve_all_dialogs(sid, "🖥️ <b>Answered at the terminal</b>")
         self._status_clear()
         state = self._session(sid)
@@ -601,6 +751,25 @@ class RemoteControlMirror:
         live.shown = text
         live.last_edit = time.monotonic()
         self._session(sid).delivered = True
+
+
+def _auto_submits(questions: list) -> bool:
+    """One single-select question answers itself on the first tap — the common case."""
+    return len(questions) == 1 and not questions[0].get("multi")
+
+
+def _format_answer(pending: dict) -> str:
+    """The user's selections, phrased for the model that will read them."""
+    parts = []
+    for qi, q in enumerate(pending["questions"]):
+        chosen = pending["selections"].get(qi) or []
+        options = q.get("options") or []
+        labels = [options[i] for i in chosen if 0 <= i < len(options)]
+        if not labels:
+            continue
+        topic = q.get("header") or q.get("question") or f"question {qi + 1}"
+        parts.append(f"{topic}: {', '.join(labels)}")
+    return "; ".join(parts)
 
 
 def _basename(path: str) -> str:

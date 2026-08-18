@@ -52,7 +52,7 @@ Enable it for a session and your phone shows the local seat, live:
 | the turn ends | the bubble disappears; the answer stays |
 | the API errors out | `⚠️ Turn ended with an error (overloaded)` |
 | a tool needs permission | `🔐 Permission needed` with **✅ Allow / ⛔ Deny** buttons — press one and the session continues |
-| it asks you a question | `❓ Waiting for your answer` with the options listed, and typing stops — the session is blocked, not busy |
+| it asks you a question | `❓ Waiting for your answer` with a **button per option** — tap one, or reply with your own answer |
 | the context is compacted | `🗜️ Conversation compacted (auto)`, so the gap is explained rather than mysterious |
 | you send `/stop` | the turn is interrupted |
 | you send `/compact`, `/model sonnet`, … | the command runs in the session |
@@ -114,10 +114,37 @@ Press one and Claude Code continues immediately. The mechanics:
   press can never decide anything;
 * prefer the old behaviour? `--no-permission-prompts` makes it a notification again.
 
-Questions Claude asks with its own picker (`AskUserQuestion`) and MCP elicitations are reported
-the same way, but **cannot be answered from Telegram**: there is no documented hook output that
-supplies an answer, only a permission *decision*. You get the question and its options so you
-know what is waiting; you answer it at the keyboard.
+### Answering Claude's questions from your phone
+
+When Claude asks something with its own picker (`AskUserQuestion`), the chat gets the question
+with one button per option:
+
+```
+❓ Waiting for your answer
+
+Approach
+Rewrite the importer or patch it?
+  • Rewrite
+  • Patch
+
+Tap an option, or reply to this message with your own answer.
+```
+
+* a single-choice question is answered by **one tap**;
+* a multi-select question toggles as you tap, then **📨 Send answer**;
+* several questions in one ask are collected together before sending;
+* **replying to the card** with free text sends that text as the answer — the equivalent of
+  typing your own option instead of picking one;
+* nobody answers within `--question-timeout` (default 120 s)? The terminal picker appears as
+  normal.
+
+How it works is worth knowing, because it constrains what is possible: Claude Code has no hook
+output that supplies a tool *result*, so the answer cannot be handed to `AskUserQuestion`
+directly. It rides back the documented way instead — the tool call is blocked with
+`permissionDecision: "deny"` and your choice goes in `permissionDecisionReason`, which Claude
+Code shows to the model, which continues with it and is told not to ask again.
+
+MCP elicitations are reported but **not** answerable: they have no equivalent decision channel.
 
 ### Driving the session from Telegram
 
@@ -178,9 +205,26 @@ Full event-by-event walkthrough: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ## Install
 
+### Let Claude Code do it
+
+This repo ships an agent playbook. Copy it in, then ask:
+
 ```bash
 git clone https://github.com/<you>/local-claude-code-remote.git
 cd local-claude-code-remote
+mkdir -p "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills"
+cp -r skills/local-remote-setup "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/"
+```
+
+> Set up Local Claude Code Remote Control for me.
+
+It runs the preflight checks, asks for the two things it can't discover (your bot token and your
+Telegram id), previews every change with `--dry-run` first, and verifies the result. See
+[`skills/`](skills) for what it will and won't do.
+
+### Or by hand
+
+```bash
 python3 -m pip install --user .          # or: pip install --user -e . while developing
 
 # 1. one-time Agent2Telegram setup (bot token, your user id, attach mode + tmux session)
@@ -243,6 +287,7 @@ python3 -m agent2telegram remote-control uninstall       # remove hooks, Skill a
 | [`docs/QWEN_CCR_SETUP.md`](docs/QWEN_CCR_SETUP.md) | the reference Qwen + CCR + tmux + Telegram arrangement |
 | [`docs/SECURITY.md`](docs/SECURITY.md) | threat model, what is stored, what is never stored |
 | [`docs/UPSTREAM_README.md`](docs/UPSTREAM_README.md) | upstream Agent2Telegram's README, verbatim |
+| [`skills/`](skills) | the `local-remote-setup` agent playbook — let Claude Code install this for you |
 | [`examples/`](examples) | sanitized launcher, shell integration and bridge config |
 
 ## Compatibility
@@ -261,6 +306,7 @@ run and pass. The changes are additive:
 | File | Change |
 | --- | --- |
 | `agent2telegram/remote_control/` | **new** — hook adapter, spool, mirror, CLI, installer, bridge supervision, Skill template |
+| `skills/local-remote-setup/` | **new** — agent playbook for installing and troubleshooting |
 | `agent2telegram/attach.py` | consume the spool in the outbound loop; route `callback_query` updates to the mirror; the typing indicator honours the mirror; the durable send path takes a `parse_mode` |
 | `agent2telegram/telegram.py` | inline keyboards on send/edit, `answerCallbackQuery`, and `edit_plain` now reports success so a caller can fall back to plain text |
 | `agent2telegram/readers.py` | the Claude tool summarizer moved to `remote_control.core` so the hook path shares it |

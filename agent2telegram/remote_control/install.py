@@ -29,7 +29,7 @@ EVENT_TIMEOUTS = {
     "SessionEnd": 5,
     "UserPromptSubmit": 5,
     "MessageDisplay": 5,
-    "PreToolUse": 5,
+    "PreToolUse": 5,                 # replaced at install time — AskUserQuestion waits
     "PostToolUse": 5,                # blocking dialogs only — see EVENT_MATCHERS
     "PostToolUseFailure": 5,
     "PermissionRequest": 5,          # replaced at install time — this one deliberately waits
@@ -174,11 +174,13 @@ def _skill_source() -> Path:
 
 def render_skill(dest: Path, *, skill_name: str, label: str, python: str,
                  config: str = "", permissions: bool = True,
-                 permission_timeout: float = core.PERMISSION_TIMEOUT) -> list[str]:
+                 permission_timeout: float = core.PERMISSION_TIMEOUT,
+                 question_timeout: float = core.QUESTION_TIMEOUT) -> list[str]:
     """Materialize the Skill with this machine's paths. Returns the files written."""
     src = _skill_source()
     config_arg = f" \\\n    --config {shlex.quote(config)}" if config else ""
-    perm_args = f" \\\n    --permission-timeout {permission_timeout:g}"
+    perm_args = (f" \\\n    --permission-timeout {permission_timeout:g}"
+                 f" \\\n    --question-timeout {question_timeout:g}")
     if not permissions:
         perm_args += " \\\n    --no-permission-prompts"
     subs = {
@@ -244,15 +246,18 @@ def install(args) -> int:
     # ---- Skill
     permissions = not getattr(args, "no_permission_prompts", False)
     permission_timeout = float(getattr(args, "permission_timeout", core.PERMISSION_TIMEOUT))
+    question_timeout = float(getattr(args, "question_timeout", core.QUESTION_TIMEOUT))
     if dry:
         changes.append(f"would install Skill → {skill_dir}")
     else:
         written = render_skill(skill_dir, skill_name=skill_name, label=label,
                                python=python, config=str(cfg_path),
-                               permissions=permissions, permission_timeout=permission_timeout)
+                               permissions=permissions, permission_timeout=permission_timeout,
+                               question_timeout=question_timeout)
         changes.append(f"installed Skill → {skill_dir} ({len(written)} files)")
-    changes.append("remote permission approval: "
-                   + (f"on (waits {permission_timeout:g}s, then the terminal prompt)"
+    changes.append("remote decisions: "
+                   + (f"on — permissions wait {permission_timeout:g}s, questions "
+                      f"{question_timeout:g}s, then the terminal takes over"
                       if permissions else "off (notification only)"))
 
     # ---- settings.json
@@ -272,6 +277,8 @@ def install(args) -> int:
     timeouts = dict(EVENT_TIMEOUTS)
     # The approval hook blocks on purpose while a human decides, so it needs a real budget.
     timeouts["PermissionRequest"] = int(permission_timeout) + PERMISSION_HOOK_HEADROOM
+    # PreToolUse blocks only for AskUserQuestion; for every other tool it still returns in ms.
+    timeouts["PreToolUse"] = int(question_timeout) + PERMISSION_HOOK_HEADROOM
     removed_total = 0
     for event, timeout in timeouts.items():
         groups = hooks.get(event) or []

@@ -876,13 +876,17 @@ class SpoolTests(_StateCase):
 # --------------------------------------------------------------------------- blocking dialogs
 
 class BlockingDialogTests(_StateCase):
-    """A session that has STOPPED to ask must not look like a session that is working."""
+    """Surface-only mode: a session that has STOPPED to ask must not look like a busy one.
+
+    Remote answering is covered separately in :class:`QuestionAnswerTests`; here it is switched
+    off, which is also what happens whenever no bridge is consuming.
+    """
 
     def setUp(self) -> None:
         super().setUp()
         self.chat = _FakeChat()
         self.mirror = _mirror_for(self.chat)
-        self.enable()
+        core.bind_session(SID, bridge=BRIDGE, permissions=False)
 
     QUESTION = {"questions": [{"header": "Approach", "question": "Which way?",
                                "options": [{"label": "Rewrite", "description": "start over"},
@@ -953,6 +957,226 @@ class BlockingDialogTests(_StateCase):
         self.hook("MessageDisplay", message_id="m1", turn_id="t1", index=0,
                   delta="thinking…", final=False)
         self.mirror.tick()
+
+
+# --------------------------------------------------------------------------- answering
+
+class QuestionAnswerTests(_StateCase):
+    """Answering Claude's own question from the chat.
+
+    There is no hook output that supplies a tool RESULT, so the answer rides back the documented
+    way: block AskUserQuestion with `deny` and put the choice in permissionDecisionReason, which
+    Claude Code shows to the model.
+    """
+
+    SINGLE = {"questions": [{"header": "Approach", "question": "Rewrite or patch?",
+                             "options": [{"label": "Rewrite"}, {"label": "Patch"}],
+                             "multiSelect": False}]}
+    MULTI = {"questions": [{"header": "Targets", "question": "Which files?",
+                            "options": [{"label": "importer.ts"}, {"label": "reconcile.ts"},
+                                        {"label": "types.ts"}],
+                            "multiSelect": True}]}
+    TWO = {"questions": [
+        {"header": "Approach", "question": "Rewrite or patch?",
+         "options": [{"label": "Rewrite"}, {"label": "Patch"}], "multiSelect": False},
+        {"header": "Tests", "question": "Run them?",
+         "options": [{"label": "Yes"}, {"label": "No"}], "multiSelect": False}]}
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.chat = _FakeChat()
+        self.mirror = _mirror_for(self.chat)
+        self.enable()
+        core.touch_heartbeat(BRIDGE)          # a bridge is listening → answering is possible
+
+    def _ask(self, tool_input, timeout=6.0):
+        core.bind_session(SID, bridge=BRIDGE, question_timeout=timeout)
+        core.touch_heartbeat(BRIDGE)
+        box = {}
+
+        def run():
+            box["out"] = core.handle({"hook_event_name": "PreToolUse", "session_id": SID,
+                                      "tool_name": "AskUserQuestion", "tool_use_id": "tu1",
+                                      "tool_input": tool_input})
+
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        return t, box
+
+    def _await_card(self, timeout=5.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            self.mirror.tick()
+            if self.chat.keyboards:
+                return next(iter(self.chat.keyboards))
+            time.sleep(0.02)
+        self.fail("no question card was posted")
+
+    def _press(self, mid, label, user_id=1):
+        for row in self.chat.keyboards[mid]["inline_keyboard"]:
+            for button in row:
+                if button["text"].lstrip("✅ ").startswith(label):
+                    return self.mirror.handle_callback(
+                        {"id": "cb", "data": button["callback_data"], "from": {"id": user_id},
+                         "message": {"message_id": mid, "text": self.chat.messages[mid]}}, [1])
+        raise AssertionError(f"no button matching {label!r}")
+
+    @staticmethod
+    def _reason(box):
+        return box["out"]["hookSpecificOutput"]["permissionDecisionReason"]
+
+    # ---- the happy paths
+    def test_one_tap_answers_a_single_choice_question(self):
+        thread, box = self._ask(self.SINGLE)
+        mid = self._await_card()
+        self._press(mid, "Rewrite")
+        thread.join(5)
+        out = box["out"]["hookSpecificOutput"]
+        self.assertEqual(out["hookEventName"], "PreToolUse")
+        self.assertEqual(out["permissionDecision"], "deny")
+        self.assertIn("Approach: Rewrite", out["permissionDecisionReason"])
+
+    def test_the_model_is_told_not_to_ask_again(self):
+        thread, box = self._ask(self.SINGLE)
+        self._press(self._await_card(), "Patch")
+        thread.join(5)
+        self.assertIn("do not ask again", self._reason(box))
+
+    def test_multi_select_toggles_and_waits_for_send(self):
+        thread, box = self._ask(self.MULTI)
+        mid = self._await_card()
+        self._press(mid, "importer.ts")
+        self.assertTrue(thread.is_alive())          # nothing submitted yet
+        self._press(mid, "types.ts")
+        self._press(mid, "📨")
+        thread.join(5)
+        reason = self._reason(box)
+        self.assertIn("importer.ts", reason)
+        self.assertIn("types.ts", reason)
+        self.assertNotIn("reconcile.ts", reason)
+
+    def test_multi_select_can_be_deselected(self):
+        thread, box = self._ask(self.MULTI)
+        mid = self._await_card()
+        self._press(mid, "importer.ts")
+        self._press(mid, "importer.ts")             # tap again to unselect
+        self._press(mid, "reconcile.ts")
+        self._press(mid, "📨")
+        thread.join(5)
+        self.assertNotIn("importer.ts", self._reason(box))
+        self.assertIn("reconcile.ts", self._reason(box))
+
+    def test_several_questions_are_all_collected(self):
+        thread, box = self._ask(self.TWO)
+        mid = self._await_card()
+        self._press(mid, "Patch")
+        self.assertTrue(thread.is_alive())          # more than one question → explicit send
+        self._press(mid, "Yes")
+        self._press(mid, "📨")
+        thread.join(5)
+        reason = self._reason(box)
+        self.assertIn("Approach: Patch", reason)
+        self.assertIn("Tests: Yes", reason)
+
+    def test_send_with_nothing_chosen_does_not_submit(self):
+        thread, box = self._ask(self.MULTI)
+        mid = self._await_card()
+        self._press(mid, "📨")
+        self.assertTrue(thread.is_alive())
+        self.assertEqual(self.chat.answered[-1][1], "Choose an option first.")
+        self._press(mid, "types.ts")
+        self._press(mid, "📨")
+        thread.join(5)
+        self.assertIn("types.ts", self._reason(box))
+
+    def test_a_free_text_reply_is_the_answer(self):
+        thread, box = self._ask(self.SINGLE)
+        mid = self._await_card()
+        self.assertTrue(self.mirror.answer_question_reply(mid, "neither — do it in two passes"))
+        thread.join(5)
+        self.assertIn("two passes", self._reason(box))
+
+    def test_a_reply_to_something_else_is_not_swallowed(self):
+        self._ask(self.SINGLE)
+        self._await_card()
+        self.assertFalse(self.mirror.answer_question_reply(999999, "unrelated message"))
+
+    # ---- the card
+    def test_the_card_shows_the_options_and_the_selection(self):
+        thread, box = self._ask(self.MULTI)
+        mid = self._await_card()
+        self.assertIn("Which files?", self.chat.messages[mid])
+        self.assertIn("importer.ts", self.chat.messages[mid])
+        self._press(mid, "importer.ts")
+        self.assertIn("✅ importer.ts", self.chat.messages[mid])
+        self._press(mid, "📨")
+        thread.join(5)
+        self.assertIn("Answered", self.chat.messages[mid])
+        self.assertEqual(self.chat.keyboards[mid], mirror_mod.NO_KEYBOARD)
+
+    def test_typing_stops_while_the_question_is_open(self):
+        self.hook("MessageDisplay", message_id="m1", turn_id="t", index=0, delta="working")
+        self.mirror.tick()
+        self.assertEqual(self.chat.active[-1], True)
+        thread, box = self._ask(self.SINGLE)
+        mid = self._await_card()
+        self.assertEqual(self.chat.active[-1], False)
+        self._press(mid, "Rewrite")
+        thread.join(5)
+        self.assertEqual(self.chat.active[-1], True)
+
+    # ---- the safe fallbacks
+    def test_no_answer_falls_back_to_the_terminal_picker(self):
+        core.bind_session(SID, bridge=BRIDGE, question_timeout=0.3)
+        core.touch_heartbeat(BRIDGE)
+        out = core.handle({"hook_event_name": "PreToolUse", "session_id": SID,
+                           "tool_name": "AskUserQuestion", "tool_use_id": "tu1",
+                           "tool_input": self.SINGLE})
+        self.assertIsNone(out)                        # no decision → the tool runs as normal
+        self.assertIn("question_expired", self.kinds())
+
+    def test_no_bridge_means_report_only_and_no_waiting(self):
+        os.unlink(core.heartbeat_path(BRIDGE))
+        started = time.monotonic()
+        out = core.handle({"hook_event_name": "PreToolUse", "session_id": SID,
+                           "tool_name": "AskUserQuestion", "tool_use_id": "tu1",
+                           "tool_input": self.SINGLE})
+        self.assertIsNone(out)
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertEqual(self.kinds(), ["question"])   # reported, not asked
+
+    def test_remote_decisions_off_reports_only(self):
+        core.bind_session(SID, bridge=BRIDGE, permissions=False)
+        out = core.handle({"hook_event_name": "PreToolUse", "session_id": SID,
+                           "tool_name": "AskUserQuestion", "tool_use_id": "tu1",
+                           "tool_input": self.SINGLE})
+        self.assertIsNone(out)
+        self.assertEqual(self.kinds(), ["question"])
+
+    def test_ordinary_tools_never_block(self):
+        started = time.monotonic()
+        core.handle({"hook_event_name": "PreToolUse", "session_id": SID,
+                     "tool_name": "Bash", "tool_input": {"command": "ls"}})
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertEqual(self.kinds(), ["tool"])
+
+    def test_a_stranger_cannot_answer(self):
+        thread, box = self._ask(self.SINGLE)
+        mid = self._await_card()
+        self._press(mid, "Rewrite", user_id=999)
+        self.assertTrue(thread.is_alive())            # still waiting
+        self.assertEqual(self.chat.answered[-1][1], "Not authorized.")
+        self._press(mid, "Rewrite")
+        thread.join(5)
+        self.assertIn("Rewrite", self._reason(box))
+
+    def test_turn_end_retracts_an_unanswered_question(self):
+        thread, box = self._ask(self.SINGLE, timeout=4.0)
+        mid = self._await_card()
+        self.hook("Stop", last_assistant_message="")
+        self.mirror.tick()
+        self.assertEqual(self.chat.keyboards[mid], mirror_mod.NO_KEYBOARD)
+        thread.join(6)
 
 
 # --------------------------------------------------------------------------- compaction
