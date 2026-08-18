@@ -122,11 +122,25 @@ def heartbeat_path(bridge: str) -> str:
 
 
 def _mkdir_private(path: str) -> None:
+    """Create *path* and tighten every level of it up to the Remote Control root to 0700.
+
+    ``os.makedirs(mode=...)`` only applies the mode to the LEAF; intermediate directories get
+    the default 0777 & ~umask. Since these directories hold message content, walk back up and
+    fix each one."""
     os.makedirs(path, mode=0o700, exist_ok=True)
-    try:
-        os.chmod(path, 0o700)
-    except OSError:
-        pass
+    root = root_dir()
+    current = path
+    while True:
+        try:
+            os.chmod(current, 0o700)
+        except OSError:
+            pass
+        if current == root or len(current) <= len(root):
+            return
+        parent = os.path.dirname(current)
+        if parent == current:
+            return
+        current = parent
 
 
 def _write_private(path: str, text: str) -> None:
@@ -299,6 +313,7 @@ def touch_heartbeat(bridge: str) -> None:
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(str(int(time.time())))
+        os.chmod(path, 0o600)          # the mode above only applies when the file is created
     except OSError:
         pass
 

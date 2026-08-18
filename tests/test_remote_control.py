@@ -87,13 +87,20 @@ class RemoteStateTests(_StateCase):
 
     def test_state_files_are_private(self):
         self.enable()
+        core.set_origin(BRIDGE, SID, "terminal")
         core.write_event(BRIDGE, {"type": "prompt", "text": "hi"})
         for path in (core.enabled_marker(BRIDGE, SID), core.session_index(SID),
+                     core.origin_path(BRIDGE, SID),
                      *(p for p, _ in core.read_events(BRIDGE))):
             self.assertEqual(os.stat(path).st_mode & 0o777, 0o600, path)
         self.assertEqual(os.stat(core.events_dir(BRIDGE)).st_mode & 0o777, 0o700)
         core.touch_heartbeat(BRIDGE)
         self.assertEqual(os.stat(core.heartbeat_path(BRIDGE)).st_mode & 0o777, 0o600)
+        # Every directory level, not just the leaf — os.makedirs only modes the last one.
+        for d in (core.root_dir(), core.sessions_dir(), core.bridge_dir(BRIDGE),
+                  os.path.dirname(core.enabled_marker(BRIDGE, SID)),
+                  os.path.dirname(core.origin_path(BRIDGE, SID))):
+            self.assertEqual(os.stat(d).st_mode & 0o777, 0o700, d)
 
 
 # --------------------------------------------------------------------------- lifecycle
