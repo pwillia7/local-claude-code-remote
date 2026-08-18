@@ -72,14 +72,19 @@ def hook_python(explicit: str = "") -> str:
     return explicit or sys.executable or "python3"
 
 
-def hook_command(python: str) -> str:
-    """The registered fast hook command.
+def hook_argv(python: str) -> list:
+    """The registered fast hook command, as argv.
 
     ``-S -E`` skips ``site`` processing and ``PYTHONPATH``, which roughly halves interpreter
     start-up. It is safe here precisely because :mod:`agent2telegram.remote_control.core` is
     standard-library only and has no relative imports, so it runs fine as a plain script.
     """
-    return f"{shlex.quote(python)} -S -E {shlex.quote(str(Path(core.__file__).resolve()))}"
+    return [python, "-S", "-E", str(Path(core.__file__).resolve())]
+
+
+def hook_command(python: str) -> str:
+    """The same command as one properly quoted string, which is what settings.json takes."""
+    return shlex.join(hook_argv(python))
 
 
 def stop_command(python: str) -> str:
@@ -389,10 +394,9 @@ def doctor(args) -> int:
         print("tmux              : ✓")
     print(f"claude binary     : {shutil.which('claude') or '✗ not on PATH'}")
 
-    cmd = hook_command(hook_python())
-    probe = subprocess.run(cmd, shell=True, input="{}", text=True,
-                           capture_output=True, timeout=30)
-    print(f"hook command      : {'✓' if probe.returncode == 0 else '✗'} {cmd}")
+    argv = hook_argv(hook_python())          # argv list, never a shell string
+    probe = subprocess.run(argv, input="{}", text=True, capture_output=True, timeout=30)
+    print(f"hook command      : {'✓' if probe.returncode == 0 else '✗'} {shlex.join(argv)}")
     ok &= probe.returncode == 0
 
     print("\n" + ("✓ Remote Control looks healthy." if ok else "✗ Some checks failed."))
