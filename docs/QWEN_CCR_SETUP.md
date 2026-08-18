@@ -178,9 +178,27 @@ claude-profile-skills ignore sanity-migration   # and stop mentioning that one
 ```
 
 It links rather than copies, so editing the personal skill updates both, and it only ever removes
-links it made itself. Wire `claude-profile-skills --check` into the launcher (see
-[`examples/qwen-direct`](../examples/qwen-direct)) and you get a one-line notice at launch when
-something new shows up.
+links it made itself.
+
+Two ways to reach it, and you want both:
+
+* **At launch** — wire `claude-profile-skills --check` into the launcher (see
+  [`examples/qwen-direct`](../examples/qwen-direct)) for a one-line notice when something new
+  appears. `--hint "run /skills-sync inside the session"` points it at the command below.
+* **Inside the session** — install
+  [`examples/skills-sync-skill`](../examples/skills-sync-skill/) into the profile's `skills/`
+  and you get `/skills-sync`, so you never have to drop back to a shell:
+
+  ```
+  /skills-sync                      what this harness can't see
+  /skills-sync link agent-browser   link it in
+  /skills-sync ignore sanity-migration
+  ```
+
+  Add the script to `permissions.allow` (`Bash(<skill dir>/scripts/skills.sh *)`) so it runs
+  without a prompt, the same way the Remote Control Skill does. It is marked
+  `disable-model-invocation: true`: which skills a session loads is a user decision, so the model
+  can report on it but not change it on its own.
 
 It notifies rather than linking automatically on purpose. Each linked skill adds its frontmatter
 to every session's system prompt — small, roughly 50–200 tokens each — but a smaller local model

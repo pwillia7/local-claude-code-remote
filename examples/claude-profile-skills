@@ -87,6 +87,9 @@ def main() -> int:
                     help="print one line only if something is missing; always exit 0")
     ap.add_argument("--profile", default="", help="the harness's config dir")
     ap.add_argument("--personal", default="", help="the personal config dir (default ~/.claude)")
+    ap.add_argument("--hint", default="",
+                    help="what --check tells the user to run (e.g. a slash command available "
+                         "inside the harness)")
     args = ap.parse_args()
 
     personal = Path(args.personal).expanduser() / "skills" if args.personal else personal_dir()
@@ -103,8 +106,9 @@ def main() -> int:
         # Deliberately terse and silent when there is nothing to say: this prints on every launch.
         if missing:
             names = ", ".join(missing[:4]) + (f" +{len(missing) - 4} more" if len(missing) > 4 else "")
+            hint = args.hint or "claude-profile-skills link <name>   (or: ignore <name>)"
             print(f"⧉ {len(missing)} skill(s) installed for Claude Code but not in this profile: "
-                  f"{names}\n  claude-profile-skills link <name>   (or: ignore <name>)")
+                  f"{names}\n  {hint}")
         return 0
 
     if args.command == "list":
