@@ -146,22 +146,74 @@ Code shows to the model, which continues with it and is told not to ask again.
 
 MCP elicitations are reported but **not** answerable: they have no equivalent decision channel.
 
+### What you can send to the session
+
+All of this is upstream Agent2Telegram's, and it works here unchanged:
+
+| You send | What happens |
+| --- | --- |
+| **text** | goes straight to the live session as a prompt |
+| **a photo** | downloaded to the machine and handed to the agent as a file reference |
+| **a file** | same — up to Telegram's 20 MB bot limit, which it tells you about if you exceed it |
+| **a voice note** | transcribed, then sent as text — **off by default**, see below |
+| **a ❤️ reaction** | delivered to the agent as quick feedback, no reply expected |
+| **a reply to a question card** | taken as your answer to that question |
+
+#### Voice notes (optional)
+
+Voice messages are transcribed with **ElevenLabs Scribe** (`scribe_v1`) using **your own** API
+key — there is no shared key, no extra Python dependency, and it is off until you add one:
+
+```bash
+export ELEVENLABS_API_KEY="sk_..."      # or set "elevenlabs_api_key" in config.json
+```
+
+or from the chat, `/setkey <your-key>` — which then **deletes your message**, so the key is not
+left sitting in the conversation. Without a key, a voice note gets a short "not enabled" notice.
+Photos and files need no setup.
+
+Note that this uploads the audio to ElevenLabs, a third party; see
+[`docs/SECURITY.md`](docs/SECURITY.md).
+
 ### Driving the session from Telegram
 
 Beyond sending prompts:
 
 | Command | Effect |
 | --- | --- |
+| `/start`, `/help` | what you can send |
+| `/status` | which agent and tmux session you're driving, and whether voice is on |
+| `/id` | your Telegram id, for the allow-list |
+| `/setkey <key>` | enable voice transcription (your message is deleted afterwards) |
 | `/stop` | Interrupt the running turn (the agent's own Escape, not a kill) |
 | `/compact`, `/clear`, `/context`, `/usage`, `/recap` | Run in the session |
 | `/model sonnet`, `/effort high`, `/fast`, `/color`, `/rename` | Run with the argument |
 | `/mcp`, `/config`, `/autocompact`, `/reload-plugins` | Run in the session |
 
-These are forwarded verbatim, because the agent only treats a line as a command when `/` is the
+The first four are answered by the bridge itself; the rest are forwarded to the agent verbatim,
+because it only treats a line as a command when `/` is the
 very first character — which is why the `[TG] ` origin prefix is recorded out of band for them
 instead. `/exit` is deliberately not forwarded: it would end the session in the tmux seat and
 take the remote side down with it. Anything else starting with `/` is passed to the agent as
 ordinary text, as before.
+
+### Also inherited from Agent2Telegram
+
+Documented in full in [`docs/UPSTREAM_README.md`](docs/UPSTREAM_README.md), and easy to miss
+because this README is about the fork:
+
+| | |
+| --- | --- |
+| `agent2telegram notify "build finished ✅"` | push a message to yourself from a cron job or a background script — the supported way for something *outside* a turn to reach you |
+| `agent2telegram service` | prints a systemd or launchd unit, so the bridge survives a reboot |
+| `agent2telegram selftest --agent claude-code` | end-to-end test against a real agent in a throwaway tmux session, with a fake Telegram — no bot, no chat touched |
+| `agent2telegram doctor` | checks the bridge config and the token, with the token redacted |
+| `agent2telegram uninstall` | removes the bridge itself (`remote-control uninstall` removes only this fork's part) |
+| `Dockerfile` | container image for the bridge; the agent CLI and its login are not baked in |
+
+Long replies are split at Telegram's 4096-character limit on paragraph, line or word boundaries;
+flood control (`429`), transient network errors and Markdown parse failures are all handled, and
+a reply whose send hard-fails is queued to disk and retried until Telegram confirms it.
 
 ### Connecting mid-session
 
@@ -328,8 +380,8 @@ sessions" — invites the assumption that it is a drop-in replacement. It isn't.
   `CLAUDE_CLIENT_PRESENCE_FILE`); every message here reaches your phone regardless.
 * **MCP elicitations are reported, not answerable** — unlike `AskUserQuestion`, they have no
   decision channel, only a refusal.
-* **Files and images Claude produces arrive as text.** Inbound works (send photos, documents and
-  voice notes *to* the session); outbound attachments do not.
+* **Files and images Claude produces arrive as text.** Inbound works — see
+  [What you can send](#what-you-can-send-to-the-session) — but outbound attachments do not.
 * Cross-session messaging, Trusted Devices and organization policy controls: not applicable.
 
 **Deliberate, not missing:**

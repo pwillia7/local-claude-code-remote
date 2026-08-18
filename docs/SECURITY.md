@@ -106,6 +106,20 @@ ability to send prompts, which that user already has. Two specifics:
 * `/exit` is excluded on purpose — it would end the session in the tmux seat and take the remote
   side down with it, which is a denial of service rather than a feature.
 
+## Voice transcription sends audio off the machine
+
+Voice notes are transcribed by **ElevenLabs**, a third party. If you enable it, the audio you
+record — which may include anything audible around you — is uploaded to their API, and their
+terms and retention policy govern it, not this project's. Specifics:
+
+* it is **off by default** and stays off until *you* add a key; nothing is uploaded before that;
+* the key is **yours**, not a shared one, and lives in the same `0600` config as the bot token;
+* `/setkey <key>` deletes your message straight after saving, so the key is not left sitting in
+  the chat history where anyone with the account can read it;
+* text, photos and files never touch ElevenLabs — only voice notes do;
+* to turn it off again, clear `elevenlabs_api_key` in the config (and unset
+  `ELEVENLABS_API_KEY`).
+
 ## The connect-time recap
 
 Enabling mirroring sends a digest of the last few exchanges so a phone joining mid-session has
@@ -137,7 +151,7 @@ read is a machine where you should stop the mirror.
 
 ## Secrets
 
-The Telegram bot token and the optional ElevenLabs key live **only** in
+The Telegram bot token and the optional ElevenLabs key (see above) live **only** in
 `~/.config/agent2telegram/config.json` (`0600`, in a `0700` directory), which is
 `.gitignore`d and must never be committed. The Remote Control layer:
 
