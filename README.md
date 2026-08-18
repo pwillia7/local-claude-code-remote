@@ -38,6 +38,22 @@ subagents, the filesystem access. Only the *remote surface* is missing.
 This project rebuilds that remote surface out of **documented Claude Code hooks** and sends it
 to Telegram.
 
+## Do I need CCR?
+
+**No.** Nothing in the code knows or cares what the model backend is — it only needs Claude Code
+running in a tmux session, plus its hooks. CCR is simply the thing that *created* the need, by
+disabling native Remote Control.
+
+Native Remote Control is unavailable — and this is useful — whenever any of these is true:
+
+* you authenticate with an **API key** rather than a Pro/Max/Team/Enterprise subscription;
+* you are on **Amazon Bedrock**, **Google Cloud's Agent Platform** or **Microsoft Foundry**;
+* `ANTHROPIC_BASE_URL` points at an **LLM gateway or proxy** — CCR, LiteLLM, your own;
+* or you just want the session in **Telegram** rather than claude.ai and the Claude app.
+
+On an ordinary subscription-backed setup, native Remote Control is the better tool and you should
+use it. This exists for the cases where you can't.
+
 ## What you get
 
 Enable it for a session and your phone shows the local seat, live:
