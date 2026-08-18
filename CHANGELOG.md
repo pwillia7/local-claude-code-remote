@@ -6,6 +6,22 @@ voice, self-tests — is unchanged and its tests still pass.
 
 ## Unreleased (1.2.0+local-remote.1)
 
+### Fixed — every message arriving twice
+
+`UserPromptSubmit` carries the prompt in **`prompt`**. This read `user_input`, a name taken from
+a documentation summary rather than the wire. Every prompt therefore read as empty, every turn
+classified as `terminal`, and Telegram-originated turns were mirrored *as well as* forwarded by
+the attach path — two copies of everything. Local prompts were never mirrored either, for the
+same reason. Auto-compaction made it stickier: `SessionStart(compact)` reset the turn origin, and
+compaction fires *mid-turn*, so even a correctly classified Telegram turn flipped to `terminal`
+halfway through. The origin is now owned solely by `UserPromptSubmit`, an unreadable prompt never
+reclassifies a turn, and `StopFailure`'s real fields (`error`, `last_assistant_message`) are used
+instead of the invented `error_type`/`error_message`.
+
+The unit tests did not catch any of this because they fabricated payloads with the same wrong
+key. Field names are now asserted against payloads captured from a live Claude Code run.
+
+
 ### Hook-based local Remote Control
 
 The core of the fork. Native Claude Code Remote Control is disabled whenever `ANTHROPIC_BASE_URL`

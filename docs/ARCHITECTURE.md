@@ -71,9 +71,9 @@ human. Registered with a `timeout` of the wait plus 30 s, so our own graceful fa
 first rather than Claude Code killing the hook mid-wait.
 
 `PostToolUse` is registered **only** with a matcher for `AskUserQuestion` (`EVENT_MATCHERS`). It
-fires for every tool otherwise, and carries `tool_output`, which is both large and the likeliest
+fires for every tool otherwise, and carries `tool_response`, which is both large and the likeliest
 place for a secret to appear — so it is scoped to the one thing we need from it: knowing that a
-blocking question was answered. The mirror never reads the output field.
+blocking question was answered. The mirror never reads that field.
 
 `Stop` and `StopFailure` additionally run upstream's own `agent2telegram.stop_hook`, which writes
 the bridge's `turn_end` marker. That keeps the **Telegram-originated** path's typing indicator

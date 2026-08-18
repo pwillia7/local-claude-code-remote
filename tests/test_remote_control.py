@@ -201,20 +201,20 @@ class OriginTests(_StateCase):
 
     def test_terminal_prompt_is_mirrored(self):
         self.enable()
-        self.hook("UserPromptSubmit", user_input="investigate duplicates")
+        self.hook("UserPromptSubmit", prompt="investigate duplicates")
         self.assertEqual(self.kinds(), ["prompt"])
         self.assertEqual(self.events()[0]["text"], "investigate duplicates")
         self.assertEqual(core.get_origin(BRIDGE, SID), "terminal")
 
     def test_telegram_prompt_is_not_mirrored(self):
         self.enable()
-        self.hook("UserPromptSubmit", user_input="[TG] investigate duplicates")
+        self.hook("UserPromptSubmit", prompt="[TG] investigate duplicates")
         self.assertEqual(self.kinds(), [])
         self.assertEqual(core.get_origin(BRIDGE, SID), "telegram")
 
     def test_telegram_turn_produces_no_mirror_events_at_all(self):
         self.enable()
-        self.hook("UserPromptSubmit", user_input="[TG] do the thing")
+        self.hook("UserPromptSubmit", prompt="[TG] do the thing")
         self.hook("MessageDisplay", message_id="m1", delta="working…", final=False)
         self.hook("PreToolUse", tool_name="Read", tool_input={"file_path": "/a/b.ts"})
         self.hook("Stop", last_assistant_message="done")
@@ -222,17 +222,94 @@ class OriginTests(_StateCase):
 
     def test_next_terminal_turn_reclassifies(self):
         self.enable()
-        self.hook("UserPromptSubmit", user_input="[TG] remote turn")
-        self.hook("UserPromptSubmit", user_input="local turn")
+        self.hook("UserPromptSubmit", prompt="[TG] remote turn")
+        self.hook("UserPromptSubmit", prompt="local turn")
         self.assertEqual(core.get_origin(BRIDGE, SID), "terminal")
         self.assertEqual(self.kinds(), ["prompt"])
+
+
+# --------------------------------------------------------------------------- wire format
+
+class WireFormatTests(_StateCase):
+    """Guard the exact field names Claude Code sends.
+
+    These are not paranoia. `UserPromptSubmit` carries `prompt`; this code read `user_input`,
+    which is what a docs summary said. Every prompt then read as empty, every turn classified as
+    terminal, and every Telegram-originated turn got mirrored *as well as* forwarded by the
+    attach path — so every message arrived twice. The unit tests missed it because they
+    fabricated payloads with the same wrong key. These assert the real wire format, captured
+    from a live Claude Code run.
+    """
+
+    def test_user_prompt_submit_uses_prompt(self):
+        self.enable()
+        core.handle({"hook_event_name": "UserPromptSubmit", "session_id": SID,
+                     "prompt": "[TG] from telegram", "prompt_id": "p1",
+                     "cwd": "/w", "permission_mode": "default",
+                     "transcript_path": "/t"})
+        self.assertEqual(core.get_origin(BRIDGE, SID), "telegram")
+        self.assertEqual(self.kinds(), [])          # and therefore NOT mirrored
+
+    def test_a_local_prompt_is_read_and_mirrored(self):
+        self.enable()
+        core.handle({"hook_event_name": "UserPromptSubmit", "session_id": SID,
+                     "prompt": "fix the importer"})
+        self.assertEqual(self.events()[0]["text"], "fix the importer")
+
+    def test_prompt_text_falls_back_but_prefers_prompt(self):
+        self.assertEqual(core.prompt_text({"prompt": "a", "user_input": "b"}), "a")
+        self.assertEqual(core.prompt_text({"user_input": "b"}), "b")
+        self.assertEqual(core.prompt_text({}), "")
+
+    def test_an_unreadable_prompt_never_silently_reads_as_terminal(self):
+        # The failure that caused the duplicates: empty text must not mark a turn terminal
+        # while leaving a previously-telegram origin in place.
+        self.enable()
+        core.set_origin(BRIDGE, SID, "telegram")
+        core.handle({"hook_event_name": "UserPromptSubmit", "session_id": SID, "prompt": ""})
+        self.assertEqual(self.kinds(), [])          # nothing mirrored for an empty prompt
+
+    def test_stop_failure_uses_error(self):
+        self.enable()
+        core.handle({"hook_event_name": "StopFailure", "session_id": SID,
+                     "error": "API Error: 500", "last_assistant_message": "partial"})
+        ev = self.events()[0]
+        self.assertEqual(ev["type"], "turn_failed")
+        self.assertIn("API Error: 500", ev["error"])
+        self.assertEqual(ev["partial"], "partial")
+
+    def test_failure_text_handles_the_shapes_we_might_get(self):
+        self.assertIn("boom", core.failure_text({"error": "boom"}))
+        self.assertIn("boom", core.failure_text({"error_message": "boom"}))
+        self.assertIn("boom", core.failure_text({"error": {"message": "boom"}}))
+        self.assertEqual(core.failure_text({}), "unknown error")
+
+    def test_compaction_mid_turn_does_not_reclassify_the_turn(self):
+        # Auto-compaction fires DURING a long turn. Resetting the origin there was the second
+        # half of the duplicate bug: a Telegram turn would start being mirrored halfway through.
+        self.enable()
+        core.handle({"hook_event_name": "UserPromptSubmit", "session_id": SID,
+                     "prompt": "[TG] long job"})
+        self.assertEqual(core.get_origin(BRIDGE, SID), "telegram")
+        self.hook("SessionStart", source="compact")
+        self.assertEqual(core.get_origin(BRIDGE, SID), "telegram")   # still Telegram's turn
+        self.hook("MessageDisplay", message_id="m1", delta="still working", final=False)
+        self.assertEqual(self.kinds(), [])                            # and still not mirrored
+
+    def test_clear_also_leaves_the_origin_alone(self):
+        self.enable()
+        core.handle({"hook_event_name": "UserPromptSubmit", "session_id": SID,
+                     "prompt": "[TG] x"})
+        self.hook("SessionStart", source="clear")
+        self.assertTrue(core.is_enabled(SID))
+        self.assertEqual(core.get_origin(BRIDGE, SID), "telegram")
 
 
 # --------------------------------------------------------------------------- disabled
 
 class DisabledTests(_StateCase):
     def test_terminal_turn_generates_no_traffic_when_disabled(self):
-        for event, fields in (("UserPromptSubmit", {"user_input": "hello"}),
+        for event, fields in (("UserPromptSubmit", {"prompt": "hello"}),
                               ("MessageDisplay", {"message_id": "m", "delta": "x"}),
                               ("PreToolUse", {"tool_name": "Bash", "tool_input": {}}),
                               ("Stop", {"last_assistant_message": "done"}),
@@ -440,7 +517,7 @@ class MirrorTests(_StateCase):
 
     # ---- prompts / tools
     def test_local_prompt_is_mirrored_as_plain_text(self):
-        self.hook("UserPromptSubmit", user_input="why are pending txns duplicated?")
+        self.hook("UserPromptSubmit", prompt="why are pending txns duplicated?")
         self.mirror.tick()
         self.assertEqual(self.chat.sent_text, ["🖥️ You:\nwhy are pending txns duplicated?"])
 
@@ -547,11 +624,10 @@ class MirrorTests(_StateCase):
 
     def test_stop_failure_ends_the_turn_without_stop(self):
         self.display("m1", "started…")
-        self.hook("StopFailure", error_type="overloaded", error_message="upstream is busy")
+        self.hook("StopFailure", error="Overloaded: upstream is busy")
         self.mirror.tick()
         self.assertEqual(self.chat.stream(), ["started…"])
         self.assertEqual(len(self.chat.sent_text), 1)
-        self.assertIn("overloaded", self.chat.sent_text[0])
         self.assertIn("upstream is busy", self.chat.sent_text[0])
         self.assertGreater(self.chat.cleared, 0)
         self.assertEqual(self.chat.active[-1], False)
@@ -676,7 +752,7 @@ class PermissionApprovalTests(_StateCase):
         self.assertEqual(self.kinds(), [])
 
     def test_telegram_originated_turns_never_ask_remotely(self):
-        self.hook("UserPromptSubmit", user_input="[TG] do it")
+        self.hook("UserPromptSubmit", prompt="[TG] do it")
         out = core.handle({"hook_event_name": "PermissionRequest", "session_id": SID,
                            "tool_name": "Bash", "tool_input": {"command": "ls"}})
         self.assertIsNone(out)
@@ -830,13 +906,13 @@ class SpoolTests(_StateCase):
                          [str(i) for i in range(30)])
 
     def test_queued_events_survive_a_bridge_restart(self):
-        self.hook("UserPromptSubmit", user_input="before the restart")
+        self.hook("UserPromptSubmit", prompt="before the restart")
         chat = _FakeChat()
         self._mirror(chat).tick()                       # a *new* mirror object, as after restart
         self.assertEqual(chat.sent_text, ["🖥️ You:\nbefore the restart"])
 
     def test_consumed_events_are_not_resent(self):
-        self.hook("UserPromptSubmit", user_input="once")
+        self.hook("UserPromptSubmit", prompt="once")
         chat = _FakeChat()
         m = self._mirror(chat)
         self.assertEqual(m.tick(), 1)
@@ -847,7 +923,7 @@ class SpoolTests(_StateCase):
     def test_malformed_event_does_not_wedge_the_queue(self):
         core._write_private(os.path.join(core.events_dir(BRIDGE), "00000000-bad.json"),
                             "{not json")
-        self.hook("UserPromptSubmit", user_input="after the bad one")
+        self.hook("UserPromptSubmit", prompt="after the bad one")
         chat = _FakeChat()
         self._mirror(chat).tick()
         self.assertEqual(chat.sent_text, ["🖥️ You:\nafter the bad one"])

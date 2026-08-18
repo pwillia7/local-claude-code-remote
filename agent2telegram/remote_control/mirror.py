@@ -648,10 +648,13 @@ class RemoteControlMirror:
 
     def _on_turn_failed(self, ev: dict, sid: str) -> None:
         self._finalize_all(sid)
-        etype = ev.get("error_type") or "unknown"
-        emsg = (ev.get("error_message") or "").strip()
-        self._send_text(self._prefix(sid) + f"⚠️ Turn ended with an error ({etype})"
-                        + (f"\n\n{emsg}" if emsg else ""), parse_mode=None)
+        error = (ev.get("error") or "unknown error").strip()
+        partial = (ev.get("partial") or "").strip()
+        body = self._prefix(sid) + f"⚠️ Turn ended with an error\n\n{error}"
+        if partial and not self._session(sid).delivered:
+            # Nothing was streamed, but Claude Code handed us what it had — better than nothing.
+            body += f"\n\nLast thing it said:\n{partial}"
+        self._send_text(body, parse_mode=None)
         self._end_turn(sid)
 
     def _on_session_end(self, ev: dict, sid: str) -> None:

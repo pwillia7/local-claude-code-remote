@@ -632,6 +632,34 @@ def recap(session_id: str, cwd: str, limit: int = RECAP_MESSAGES) -> str:
 
 # --------------------------------------------------------------------------- hook adapter
 
+def prompt_text(payload: dict) -> str:
+    """The submitted prompt from a ``UserPromptSubmit`` payload.
+
+    The field is ``prompt``. It is read with a fallback because getting this wrong is not a
+    cosmetic bug: an empty string classifies every turn as terminal, so Telegram-originated
+    turns get mirrored *as well as* forwarded by the attach path, and every message arrives
+    twice. Verified against a real payload, not a doc summary.
+    """
+    for key in ("prompt", "user_input", "user_prompt"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
+def failure_text(payload: dict) -> str:
+    """A human-readable reason from a ``StopFailure`` payload (the field is ``error``)."""
+    for key in ("error", "error_message", "error_type"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return short(redact(value), 400)
+        if isinstance(value, dict):
+            for inner in ("message", "type"):
+                if isinstance(value.get(inner), str) and value[inner].strip():
+                    return short(redact(value[inner]), 400)
+    return "unknown error"
+
+
 def _emit(bridge: str, session_id: str, kind: str, **fields) -> str:
     return write_event(bridge, {"type": kind, "session_id": session_id,
                                 "bridge": slug(bridge), **fields})
@@ -646,11 +674,11 @@ def _handle_session_start(payload: dict) -> None:
         return
     if source in RESET_SOURCES:
         unbind_session(session_id)
-        return
-    binding = session_binding(session_id)
-    if binding and source in ("clear", "compact"):
-        # The turn is over and the transcript was rewritten; start the next turn clean.
-        set_origin(binding["bridge"], session_id, "terminal")
+    # Deliberately nothing for `clear` and `compact`: they keep the connection, and they must
+    # NOT touch the turn origin. Auto-compaction fires in the MIDDLE of a long turn, so
+    # resetting the origin here would reclassify a Telegram-originated turn as terminal and
+    # start mirroring messages the attach path is already forwarding. The origin is owned by
+    # UserPromptSubmit alone, which is the only event that actually starts a turn.
 
 
 def _handle_session_end(payload: dict, binding: dict) -> None:
@@ -793,7 +821,12 @@ def handle(payload: dict):
         return None
 
     if event == "UserPromptSubmit":
-        text = payload.get("user_input", "") or ""
+        text = prompt_text(payload)
+        if not text.strip():
+            # We could not read the prompt — an unexpected payload shape, or an empty submit.
+            # Do NOT touch the origin: guessing "terminal" here is what makes a Telegram turn
+            # get mirrored on top of the attach path's copy, i.e. everything twice.
+            return None
         origin = classify_origin(text, binding.get("origins") or ())
         set_origin(bridge, session_id, origin, payload.get("prompt_id", ""))
         if origin == "terminal":
@@ -868,8 +901,8 @@ def handle(payload: dict):
               last_assistant_message=payload.get("last_assistant_message", "") or "")
     elif event == "StopFailure":
         _emit(bridge, session_id, "turn_failed",
-              error_type=short(payload.get("error_type", "unknown"), 40),
-              error_message=short(redact(payload.get("error_message", "")), 400))
+              error=failure_text(payload),
+              partial=short(redact(payload.get("last_assistant_message", "")), 400))
     return None
 
 

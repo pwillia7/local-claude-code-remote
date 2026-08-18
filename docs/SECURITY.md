@@ -81,7 +81,7 @@ Mitigations:
   `url`, `query`) and are then **redacted** for common credential shapes — `FOO_TOKEN=…`,
   `Bearer …`, `sk-…`, `ghp_…`, `xox…`, AWS key ids, JWTs, Telegram bot tokens — and truncated to
   one short line.
-* `PostToolUse` is deliberately **not** registered: `tool_output` is large and is the most likely
+* `PostToolUse` is deliberately **not** registered: `tool_response` is large and is the most likely
   place for a secret to appear.
 * Full hook payloads are never logged. Diagnostics log event *types* and counts, not contents.
 
