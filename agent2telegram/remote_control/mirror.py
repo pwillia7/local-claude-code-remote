@@ -14,9 +14,12 @@ Streaming model (mirrors Claude Code's ``MessageDisplay`` events):
   * a message that outgrows Telegram's size limit is closed at a natural boundary and continued
     in a new message — content is never truncated.
 
-Text is sent as **plain text** while streaming and stays plain when finalized: a half-written
-Markdown span would make Telegram reject the edit, and a rejected edit would silently lose the
-tail of an answer.
+Text is rendered from the agent's Markdown to Telegram HTML, with a plain-text fallback on any
+rejection, so formatting is never traded for content (see :func:`_render` and ``_write``).
+
+State is **per Claude session**, not per bridge. One bridge can mirror several sessions at once,
+and mixing their streams — or letting one session's turn end finalize another's half-written
+message — is a correctness bug, not merely untidy output.
 """
 from __future__ import annotations
 
@@ -45,6 +48,8 @@ DROP_ABOVE = core.MAX_PENDING * 2
 #: Safety net: a turn that never sends Stop or StopFailure (Claude Code was killed, the machine
 #: slept) must not leave "typing…" and a status bubble lit forever.
 IDLE_DONE = 180.0
+#: How long the roster of mirrored sessions is cached — it only decides message labelling.
+ROSTER_TTL = 2.0
 #: Inline keyboard removed by replacing it with an empty one.
 NO_KEYBOARD = {"inline_keyboard": []}
 
@@ -63,7 +68,7 @@ def _render(text: str) -> str | None:
 
 
 def _replace_header(text: str, header: str) -> str:
-    """Swap the first line of an approval card for its outcome, keeping the details below.
+    """Swap the first line of a card for its outcome, keeping the details below.
 
     Telegram hands the message back as plain text (entities stripped), so the body is escaped
     rather than re-rendered."""
@@ -94,6 +99,20 @@ class _LiveMessage:
         self.closed = False
 
 
+class _Session:
+    """Everything the mirror tracks for one Claude session."""
+
+    __slots__ = ("live", "order", "delivered", "working", "waiting", "tag")
+
+    def __init__(self) -> None:
+        self.live: dict = {}     # message_id → _LiveMessage
+        self.order: list = []
+        self.delivered = False   # has this turn already put assistant text in the chat?
+        self.working = False     # a turn is in flight → drive the typing indicator
+        self.waiting: dict = {}  # open blocking dialogs, keyed by their id
+        self.tag = ""            # short human label (the project directory), for multi-session
+
+
 class RemoteControlMirror:
     """Consumes one bridge's Remote Control spool.
 
@@ -113,14 +132,14 @@ class RemoteControlMirror:
         self._status_push = status_push
         self._status_clear = status_clear
         self._set_active = set_active
-        self._live: dict[str, _LiveMessage] = {}
-        self._order: list[str] = []
-        self._delivered = False        # did this turn already put assistant text in the chat?
+        self._sessions: dict = {}
         self._active = False
         self._last_event = 0.0
+        self._roster: dict = {}
+        self._roster_at = 0.0
         # Approval cards awaiting a button press. Touched by the bridge's outbound thread (when
         # a card is posted) AND by its inbound thread (when the press arrives), so it is locked.
-        self._pending_perms: dict[str, dict] = {}
+        self._pending_perms: dict = {}
         self._perm_lock = threading.Lock()
 
     # ---- lifecycle ---------------------------------------------------------
@@ -143,14 +162,15 @@ class RemoteControlMirror:
         if handled:
             self._last_event = time.monotonic()
         elif self._active and time.monotonic() - self._last_event > IDLE_DONE:
-            # No Stop/StopFailure ever arrived — end the turn ourselves rather than leave the
-            # chat showing a session that is still working.
-            log.info("remote-control: no events for %.0fs, ending the mirrored turn", IDLE_DONE)
-            self._finalize_all()
-            self._end_turn()
+            # No Stop/StopFailure ever arrived — end the turns ourselves rather than leave the
+            # chat showing sessions that are still working.
+            log.info("remote-control: no events for %.0fs, ending the mirrored turn(s)",
+                     IDLE_DONE)
+            for session_id in list(self._sessions):
+                self._finalize_all(session_id)
+                self._end_turn(session_id)
         self._flush()
-        if handled:
-            log.debug("remote-control: applied %d event(s)", handled)
+        self._refresh_typing()
         return handled
 
     def _prune(self) -> None:
@@ -163,107 +183,245 @@ class RemoteControlMirror:
         for path, _ in core.read_events(self.bridge, drop):
             core.ack_event(path)
 
-    def _activate(self, on: bool) -> None:
-        if on != self._active:
-            self._active = on
-            self._set_active(on)
+    # ---- per-session bookkeeping ------------------------------------------
+    def _session(self, session_id: str) -> _Session:
+        state = self._sessions.get(session_id)
+        if state is None:
+            state = self._sessions[session_id] = _Session()
+        return state
+
+    def _roster_size(self) -> int:
+        """How many sessions this bridge mirrors (cached — it only decides labelling)."""
+        now = time.monotonic()
+        if now - self._roster_at > ROSTER_TTL:
+            self._roster = core.sessions_for_bridge(self.bridge)
+            self._roster_at = now
+        return len(self._roster)
+
+    def _prefix(self, session_id: str) -> str:
+        """``"[project] "`` when more than one session is mirrored, else ``""``.
+
+        A label on every line is noise in the normal one-session case, and its absence makes two
+        interleaved sessions unreadable — so it appears exactly when it is needed.
+        """
+        if self._roster_size() < 2:
+            return ""
+        state = self._session(session_id)
+        tag = state.tag or _basename(self._roster.get(session_id, {}).get("cwd", "")) \
+            or (session_id[:6] if session_id else "session")
+        return f"[{core.short(tag, 24)}] "
+
+    def _refresh_typing(self) -> None:
+        """Typing is on while any session is working and none of its dialogs are blocking."""
+        want = any(s.working and not s.waiting for s in self._sessions.values())
+        if want != self._active:
+            self._active = want
+            self._set_active(want)
+
+    def _working(self, session_id: str, on: bool) -> None:
+        self._session(session_id).working = on
+        self._refresh_typing()
 
     # ---- event dispatch ----------------------------------------------------
     def _apply(self, ev: dict) -> None:
         kind = ev.get("type")
+        sid = ev.get("session_id", "")
         if kind == "prompt":
-            self._on_prompt(ev)
+            self._on_prompt(ev, sid)
         elif kind == "message":
-            self._on_message(ev)
+            self._on_message(ev, sid)
+        elif kind == "recap":
+            self._on_recap(ev, sid)
         elif kind == "tool":
-            self._activate(True)
-            self._status_push(ev.get("summary") or "🛠️ tool")
+            self._working(sid, True)
+            self._status_push(self._prefix(sid) + (ev.get("summary") or "🛠️ tool"))
         elif kind == "tool_failed":
-            self._activate(True)
+            self._working(sid, True)
             summary = ev.get("summary") or "🛠️ tool"
-            self._status_push("⚠️ Failed: " + core.short(summary.split(" ", 1)[-1], 50))
+            self._status_push(self._prefix(sid)
+                              + "⚠️ Failed: " + core.short(summary.split(" ", 1)[-1], 50))
         elif kind == "subagent_start":
-            self._activate(True)
-            self._status_push(core.subagent_summary(ev.get("agent_type", "")))
+            self._working(sid, True)
+            self._status_push(self._prefix(sid) + core.subagent_summary(ev.get("agent_type", "")))
         elif kind == "subagent_stop":
-            self._status_push("🤖 Subagent completed")
+            self._status_push(self._prefix(sid) + "🤖 Subagent completed")
         elif kind == "task_created":
-            self._status_push("📋 Working: " + core.short(ev.get("task_name", ""), 60))
+            self._status_push(self._prefix(sid)
+                              + "📋 Working: " + core.short(ev.get("task_name", ""), 60))
         elif kind == "task_completed":
-            self._status_push("✅ Task completed: " + core.short(ev.get("task_name", ""), 60))
+            self._status_push(self._prefix(sid)
+                              + "✅ Task completed: " + core.short(ev.get("task_name", ""), 60))
+        elif kind == "question":
+            self._on_question(ev, sid)
+        elif kind == "question_answered":
+            self._resolve_dialog(sid, ev.get("tool_use_id", ""),
+                                 "✅ <b>Answered at the terminal</b>")
+        elif kind == "elicitation":
+            self._on_elicitation(ev, sid)
+        elif kind == "elicitation_done":
+            self._resolve_dialog(sid, ev.get("elicitation_id", ""),
+                                 "✅ <b>Answered at the terminal</b>")
+        elif kind == "compact_start":
+            self._working(sid, True)
+            self._status_push(self._prefix(sid)
+                              + f"🗜️ Compacting the conversation ({ev.get('trigger') or '?'})")
+        elif kind == "compact_end":
+            self._on_compact_end(ev, sid)
         elif kind == "permission":
-            self._on_permission(ev)
+            self._on_permission(ev, sid)
         elif kind == "permission_request":
-            self._on_permission_request(ev)
+            self._on_permission_request(ev, sid)
         elif kind == "permission_expired":
             self._resolve_permission(ev.get("request_id", ""),
                                      "⌛ <b>Expired</b> — answer it at the terminal.")
         elif kind == "notification":
-            self._on_notification(ev)
+            self._on_notification(ev, sid)
+        elif kind == "interrupted":
+            self._on_interrupted(ev, sid)
         elif kind == "turn_end":
-            self._on_turn_end(ev)
+            self._on_turn_end(ev, sid)
         elif kind == "turn_failed":
-            self._on_turn_failed(ev)
+            self._on_turn_failed(ev, sid)
         elif kind == "session_end":
-            self._on_session_end(ev)
+            self._on_session_end(ev, sid)
 
-    def _on_prompt(self, ev: dict) -> None:
+    # ---- prompts, recap, notices -------------------------------------------
+    def _on_prompt(self, ev: dict, sid: str) -> None:
         text = (ev.get("text") or "").strip()
-        self._delivered = False
-        self._activate(True)
+        state = self._session(sid)
+        state.delivered = False
+        if ev.get("cwd"):
+            state.tag = _basename(ev["cwd"])
+        self._working(sid, True)
         if text:
             # Plain text: a local prompt is arbitrary content and must never be re-parsed.
-            self._send_text("🖥️ You:\n" + text, parse_mode=None)
+            self._send_text(self._prefix(sid) + "🖥️ You:\n" + text, parse_mode=None)
 
-    def _on_message(self, ev: dict) -> None:
-        mid = ev.get("message_id") or ev.get("turn_id") or "message"
-        state = self._live.get(mid)
-        if state is None:
-            state = self._live[mid] = _LiveMessage()
-            self._order.append(mid)
-            # A new assistant message means the trailing tool bubble must move below it.
-            self._status_clear()
-        self._activate(True)
-        state.buf += ev.get("delta") or ""
-        if ev.get("final"):
-            state.closed = True
-            self._emit(state, force=True)          # empty final delta still finalizes
-            self._forget(mid)
+    def _on_recap(self, ev: dict, sid: str) -> None:
+        """Connecting mid-session otherwise drops you into a stream with no context."""
+        text = (ev.get("text") or "").strip()
+        if ev.get("cwd"):
+            self._session(sid).tag = _basename(ev["cwd"])
+        if text:
+            self._send_text("📜 Where this session is up to:\n\n" + text, parse_mode=None)
 
-    def _on_permission(self, ev: dict) -> None:
+    def _on_notification(self, ev: dict, sid: str) -> None:
+        texts = {
+            "idle_prompt": "🔔 Waiting for your input.",
+            "agent_needs_input": "🔔 Needs your input to continue.",
+            "agent_completed": "🔔 Finished working.",
+        }
+        text = texts.get(ev.get("notification_type", ""))
+        if text:
+            self._send_text(self._prefix(sid) + text, parse_mode=None)
+
+    def _on_compact_end(self, ev: dict, sid: str) -> None:
+        self._status_clear()
+        self._send_text(self._prefix(sid)
+                        + f"🗜️ Conversation compacted ({ev.get('trigger') or '?'}). "
+                          "Earlier context was summarized; the session continues.",
+                        parse_mode=None)
+
+    def _on_interrupted(self, ev: dict, sid: str) -> None:
+        """Interrupted from Telegram — Claude Code sends no Stop or StopFailure for that.
+
+        The bridge interrupts the tmux seat, not a particular Claude session, so an event with
+        no session id ends every turn this bridge is mirroring."""
+        targets = [sid] if sid else list(self._sessions)
+        for target in targets:
+            self._finalize_all(target)
+            self._end_turn(target)
+
+    # ---- blocking dialogs --------------------------------------------------
+    def _on_question(self, ev: dict, sid: str) -> None:
+        """``AskUserQuestion``: the session has STOPPED to ask, and emits no turn end.
+
+        Without this the chat shows "typing…" indefinitely while Claude Code sits on a picker at
+        the keyboard. There is no documented hook output that supplies an answer, so this
+        reports the question and points at the terminal instead of pretending otherwise.
+        """
+        lines = ["❓ <b>Waiting for your answer</b>"]
+        for q in ev.get("questions") or []:
+            if not isinstance(q, dict):
+                continue
+            lines.append("")
+            if q.get("header"):
+                lines.append(f"<b>{html.escape(q['header'])}</b>")
+            if q.get("question"):
+                lines.append(html.escape(q["question"]))
+            for i, option in enumerate(q.get("options") or [], 1):
+                lines.append(f"  {i}. {html.escape(option)}")
+        lines += ["", "<i>Answer it at the terminal — this one can't be answered from here.</i>"]
+        self._open_dialog(sid, ev.get("tool_use_id", ""), "\n".join(lines))
+
+    def _on_elicitation(self, ev: dict, sid: str) -> None:
+        server = ev.get("server_name") or "an MCP server"
+        body = [f"❓ <b>{html.escape(server)} is asking for input</b>"]
+        if ev.get("prompt"):
+            body += ["", html.escape(ev["prompt"])]
+        body += ["", "<i>Answer it at the terminal.</i>"]
+        self._open_dialog(sid, ev.get("elicitation_id", ""), "\n".join(body))
+
+    def _open_dialog(self, sid: str, key: str, text: str) -> None:
+        state = self._session(sid)
+        key = key or "dialog"
+        if key in state.waiting:
+            return
+        self._status_clear()               # the question must be the last thing in the chat
+        mid = self._send_plain_id(self._prefix(sid) + text, parse_mode="HTML")
+        state.waiting[key] = {"mid": mid}
+        self._refresh_typing()             # stop "typing…": it is waiting, not working
+        log.info("MIRROR (dialog) session blocked on a human answer")
+
+    def _resolve_dialog(self, sid: str, key: str, header: str) -> None:
+        state = self._session(sid)
+        pending = state.waiting.pop(key or "dialog", None)
+        if pending is None:
+            return
+        if pending.get("mid") is not None:
+            self._edit_plain(pending["mid"], header, parse_mode="HTML")
+        self._refresh_typing()
+
+    def _resolve_all_dialogs(self, sid: str, header: str) -> None:
+        for key in list(self._session(sid).waiting):
+            self._resolve_dialog(sid, key, header)
+
+    # ---- permissions -------------------------------------------------------
+    def _on_permission(self, ev: dict, sid: str) -> None:
         self._send_text(
-            "🔐 Waiting for permission\n\n"
+            self._prefix(sid) + "🔐 Waiting for permission\n\n"
             f"{ev.get('summary') or ev.get('tool_name') or 'a tool call'}\n\n"
-            "Approve or deny it in the terminal — remote approval isn't supported yet.",
+            "Approve or deny it in the terminal — remote approval is off for this session.",
             parse_mode=None)
 
-    def _on_permission_request(self, ev: dict) -> None:
+    def _on_permission_request(self, ev: dict, sid: str) -> None:
         """Post an approval card with Allow/Deny buttons; the hook is blocked waiting on it."""
         request_id = ev.get("request_id", "")
         if not request_id:
             return
-        self._activate(True)
+        self._working(sid, True)
         self._status_clear()                       # the card must be the last thing in the chat
         keyboard = {"inline_keyboard": [[
             {"text": "✅ Allow", "callback_data": f"p:{request_id}:a"},
             {"text": "⛔ Deny", "callback_data": f"p:{request_id}:d"},
         ]]}
-        mid = self._send_plain_id(self._permission_card(ev), parse_mode="HTML",
-                                  reply_markup=keyboard)
+        mid = self._send_plain_id(self._permission_card(ev, self._prefix(sid)),
+                                  parse_mode="HTML", reply_markup=keyboard)
         if mid is None:
             log.warning("remote-control: could not post the approval card; "
                         "the terminal prompt will handle it")
             return
         with self._perm_lock:
-            self._pending_perms[request_id] = {"mid": mid, "ts": time.monotonic()}
+            self._pending_perms[request_id] = {"mid": mid, "ts": time.monotonic(),
+                                               "session": sid}
         log.info("MIRROR (permission) card %s for %s", mid, ev.get("tool_name", "?"))
 
     @staticmethod
-    def _permission_card(ev: dict, header: str = "🔐 <b>Permission needed</b>") -> str:
+    def _permission_card(ev: dict, prefix: str = "") -> str:
         tool = html.escape(ev.get("tool_name") or "a tool")
         summary = html.escape(ev.get("summary") or "")
         detail = ev.get("detail") or ""
-        lines = [header, "", f"<b>{tool}</b>"]
+        lines = [f"{html.escape(prefix)}🔐 <b>Permission needed</b>", "", f"<b>{tool}</b>"]
         if summary:
             lines.append(summary)
         if detail:
@@ -298,8 +456,7 @@ class RemoteControlMirror:
         decision = "allow" if verdict == "a" else "deny"
         core.write_decision(self.bridge, request_id, decision, by=user_id)
         self._answer_callback(query, "Allowed ✅" if decision == "allow" else "Denied ⛔")
-        message = (query.get("message") or {})
-        text = message.get("text") or ""
+        text = (query.get("message") or {}).get("text") or ""
         head = "✅ <b>Allowed</b>" if decision == "allow" else "⛔ <b>Denied</b>"
         self._edit_plain(pending["mid"], _replace_header(text, head),
                          parse_mode="HTML", reply_markup=NO_KEYBOARD)
@@ -319,112 +476,132 @@ class RemoteControlMirror:
             return
         self._edit_plain(pending["mid"], header, parse_mode="HTML", reply_markup=NO_KEYBOARD)
 
-    def _resolve_all_permissions(self, header: str) -> None:
+    def _resolve_session_permissions(self, sid: str, header: str) -> None:
         with self._perm_lock:
-            ids = list(self._pending_perms)
+            ids = [rid for rid, p in self._pending_perms.items() if p.get("session") == sid]
         for request_id in ids:
             self._resolve_permission(request_id, header)
 
-    def _on_notification(self, ev: dict) -> None:
-        texts = {
-            "idle_prompt": "🔔 Waiting for your input.",
-            "agent_needs_input": "🔔 Needs your input to continue.",
-            "agent_completed": "🔔 Finished working.",
-        }
-        text = texts.get(ev.get("notification_type", ""))
-        if text:
-            self._send_text(text, parse_mode=None)
-
-    def _on_turn_end(self, ev: dict) -> None:
-        self._finalize_all()
+    # ---- turn end ----------------------------------------------------------
+    def _on_turn_end(self, ev: dict, sid: str) -> None:
+        self._finalize_all(sid)
         # Backstop: if nothing reached the chat through MessageDisplay (hook not registered,
         # a mirror error, an answer rendered some other way), deliver the documented final
         # message. No transcript parsing, and never a second copy of streamed text.
-        if not self._delivered:
+        if not self._session(sid).delivered:
             answer = (ev.get("last_assistant_message") or "").strip()
             if answer:
-                self._send_text("🖥️ " + answer)
+                self._send_text(self._prefix(sid) + "🖥️ " + answer)
                 log.info("remote-control: Stop backstop delivered the final answer")
-        self._end_turn()
+        self._end_turn(sid)
 
-    def _on_turn_failed(self, ev: dict) -> None:
-        self._finalize_all()
+    def _on_turn_failed(self, ev: dict, sid: str) -> None:
+        self._finalize_all(sid)
         etype = ev.get("error_type") or "unknown"
         emsg = (ev.get("error_message") or "").strip()
-        self._send_text(f"⚠️ Turn ended with an error ({etype})"
+        self._send_text(self._prefix(sid) + f"⚠️ Turn ended with an error ({etype})"
                         + (f"\n\n{emsg}" if emsg else ""), parse_mode=None)
-        self._end_turn()
+        self._end_turn(sid)
 
-    def _on_session_end(self, ev: dict) -> None:
-        self._finalize_all()
-        self._end_turn()
+    def _on_session_end(self, ev: dict, sid: str) -> None:
+        self._finalize_all(sid)
+        self._end_turn(sid)
+        self._sessions.pop(sid, None)
+        self._refresh_typing()
 
-    def _end_turn(self) -> None:
+    def _end_turn(self, sid: str) -> None:
         # The turn is over, so any card still showing buttons was answered at the keyboard
         # (or abandoned). Leaving live buttons would let a later press decide nothing.
-        self._resolve_all_permissions("🖥️ <b>Answered at the terminal</b>")
+        self._resolve_session_permissions(sid, "🖥️ <b>Answered at the terminal</b>")
+        self._resolve_all_dialogs(sid, "🖥️ <b>Answered at the terminal</b>")
         self._status_clear()
-        self._activate(False)
-        self._delivered = False
+        state = self._session(sid)
+        state.delivered = False
+        state.working = False
+        self._refresh_typing()
 
     # ---- streaming ---------------------------------------------------------
-    def _forget(self, mid: str) -> None:
-        self._live.pop(mid, None)
-        if mid in self._order:
-            self._order.remove(mid)
+    def _on_message(self, ev: dict, sid: str) -> None:
+        state = self._session(sid)
+        mid = ev.get("message_id") or ev.get("turn_id") or "message"
+        live = state.live.get(mid)
+        if live is None:
+            live = state.live[mid] = _LiveMessage()
+            state.order.append(mid)
+            # A new assistant message means the trailing tool bubble must move below it.
+            self._status_clear()
+        self._working(sid, True)
+        live.buf += ev.get("delta") or ""
+        if ev.get("final"):
+            live.closed = True
+            self._emit(live, sid, force=True)      # an empty final delta still finalizes
+            self._forget(state, mid)
+
+    @staticmethod
+    def _forget(state: _Session, mid: str) -> None:
+        state.live.pop(mid, None)
+        if mid in state.order:
+            state.order.remove(mid)
 
     def _flush(self) -> None:
-        """Apply throttled edits for every message still streaming."""
+        """Apply throttled edits for every message still streaming, in every session."""
         now = time.monotonic()
-        for mid in list(self._order):
-            state = self._live.get(mid)
-            if state is None:
-                continue
-            if now - state.last_edit >= EDIT_INTERVAL or len(state.buf) > CHUNK_LIMIT:
-                self._emit(state)
+        for sid, state in list(self._sessions.items()):
+            for mid in list(state.order):
+                live = state.live.get(mid)
+                if live is None:
+                    continue
+                if now - live.last_edit >= EDIT_INTERVAL or len(live.buf) > CHUNK_LIMIT:
+                    self._emit(live, sid)
 
-    def _finalize_all(self) -> None:
-        for mid in list(self._order):
-            state = self._live.get(mid)
-            if state is not None:
-                state.closed = True
-                self._emit(state, force=True)
-            self._forget(mid)
+    def _finalize_all(self, sid: str) -> None:
+        state = self._session(sid)
+        for mid in list(state.order):
+            live = state.live.get(mid)
+            if live is not None:
+                live.closed = True
+                self._emit(live, sid, force=True)
+            self._forget(state, mid)
 
-    def _emit(self, state: _LiveMessage, force: bool = False) -> None:
+    def _emit(self, live: _LiveMessage, sid: str, force: bool = False) -> None:
         """Push the buffer to Telegram, continuing into new messages when it outgrows one."""
-        if not force and time.monotonic() - state.last_edit < EDIT_INTERVAL:
+        if not force and time.monotonic() - live.last_edit < EDIT_INTERVAL:
             return
-        while len(state.buf) > CHUNK_LIMIT:
-            head, tail = _split_head(state.buf, CHUNK_LIMIT)
-            state.buf = head
-            self._write(state)                    # close the current Telegram message on `head`
-            state.buf, state.mid, state.shown = tail, None, ""
-        self._write(state)
+        while len(live.buf) > CHUNK_LIMIT:
+            head, tail = _split_head(live.buf, CHUNK_LIMIT)
+            live.buf = head
+            self._write(live, sid)                # close the current Telegram message on `head`
+            live.buf, live.mid, live.shown = tail, None, ""
+        self._write(live, sid)
 
-    def _write(self, state: _LiveMessage) -> None:
-        text = state.buf
+    def _write(self, live: _LiveMessage, sid: str) -> None:
+        text = live.buf
         if not text.strip():
             return                                 # nothing worth a Telegram message yet
-        if text == state.shown:
-            state.last_edit = time.monotonic()
+        if text == live.shown:
+            live.last_edit = time.monotonic()
             return
+        body = self._prefix(sid) + text
         # Render the agent's Markdown, but never at the cost of losing content: if Telegram
         # rejects the rich version (or it would not fit), the same text goes out as plain.
-        rendered = _render(text)
-        if state.mid is None:
+        rendered = _render(body)
+        if live.mid is None:
             mid = self._send_plain_id(rendered, parse_mode="HTML") if rendered else None
             if mid is None:
-                mid = self._send_plain_id(text)
+                mid = self._send_plain_id(body)
             if mid is None:
                 return                             # send failed; retry on the next flush
-            state.mid = mid
+            live.mid = mid
             # Metadata only — message CONTENT is never logged (see docs/SECURITY.md).
             log.info("MIRROR (stream) telegram msg %s, %d chars", mid, len(text))
         else:
-            ok = self._edit_plain(state.mid, rendered, parse_mode="HTML") if rendered else False
-            if not ok and not self._edit_plain(state.mid, text):
+            ok = self._edit_plain(live.mid, rendered, parse_mode="HTML") if rendered else False
+            if not ok and not self._edit_plain(live.mid, body):
                 return                             # leave `shown` alone so the next flush retries
-        state.shown = text
-        state.last_edit = time.monotonic()
-        self._delivered = True
+        live.shown = text
+        live.last_edit = time.monotonic()
+        self._session(sid).delivered = True
+
+
+def _basename(path: str) -> str:
+    return (path or "").rstrip("/").rsplit("/", 1)[-1]

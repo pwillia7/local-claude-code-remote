@@ -52,6 +52,10 @@ Enable it for a session and your phone shows the local seat, live:
 | the turn ends | the bubble disappears; the answer stays |
 | the API errors out | `⚠️ Turn ended with an error (overloaded)` |
 | a tool needs permission | `🔐 Permission needed` with **✅ Allow / ⛔ Deny** buttons — press one and the session continues |
+| it asks you a question | `❓ Waiting for your answer` with the options listed, and typing stops — the session is blocked, not busy |
+| the context is compacted | `🗜️ Conversation compacted (auto)`, so the gap is explained rather than mysterious |
+| you send `/stop` | the turn is interrupted |
+| you send `/compact`, `/model sonnet`, … | the command runs in the session |
 
 It works in both directions: messages you send **from** Telegram drive the same live tmux
 session through Agent2Telegram's existing attach mode, exactly as before.
@@ -78,6 +82,10 @@ session through Agent2Telegram's existing attach mode, exactly as before.
   Nothing is ever auto-approved.
 * **The bridge starts itself.** Enabling mirroring launches the bridge if it isn't running —
   and refuses to start a second one, because Telegram allows exactly one poller per bot.
+* **A blocked session never looks busy.** When Claude Code stops to ask a question, typing stops
+  and the chat says what it is waiting for.
+* **Several sessions can share one bridge.** Each keeps its own streaming state, and messages
+  gain a `[project]` label as soon as more than one is connected.
 * **Qwen through CCR is the reference configuration** — see
   [`docs/QWEN_CCR_SETUP.md`](docs/QWEN_CCR_SETUP.md). Nothing in the package is Qwen-specific.
 
@@ -105,6 +113,34 @@ Press one and Claude Code continues immediately. The mechanics:
 * the buttons are retracted once the request is answered, expires, or the turn ends, so a stale
   press can never decide anything;
 * prefer the old behaviour? `--no-permission-prompts` makes it a notification again.
+
+Questions Claude asks with its own picker (`AskUserQuestion`) and MCP elicitations are reported
+the same way, but **cannot be answered from Telegram**: there is no documented hook output that
+supplies an answer, only a permission *decision*. You get the question and its options so you
+know what is waiting; you answer it at the keyboard.
+
+### Driving the session from Telegram
+
+Beyond sending prompts:
+
+| Command | Effect |
+| --- | --- |
+| `/stop` | Interrupt the running turn (the agent's own Escape, not a kill) |
+| `/compact`, `/clear`, `/context`, `/usage`, `/recap` | Run in the session |
+| `/model sonnet`, `/effort high`, `/fast`, `/color`, `/rename` | Run with the argument |
+| `/mcp`, `/config`, `/autocompact`, `/reload-plugins` | Run in the session |
+
+These are forwarded verbatim, because the agent only treats a line as a command when `/` is the
+very first character — which is why the `[TG] ` origin prefix is recorded out of band for them
+instead. `/exit` is deliberately not forwarded: it would end the session in the tmux seat and
+take the remote side down with it. Anything else starting with `/` is passed to the agent as
+ordinary text, as before.
+
+### Connecting mid-session
+
+Enabling mirroring sends a short digest of the last few exchanges, so a phone joining an
+in-flight session has context instead of a stream that starts mid-thought. This is the only
+place the project reads a transcript — once, on your explicit action. `--no-recap` turns it off.
 
 ---
 

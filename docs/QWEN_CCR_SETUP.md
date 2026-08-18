@@ -146,8 +146,12 @@ qwen                # attach to the seat
 /qwen-remote        # toggle mirroring for THIS session
 ```
 
-Telegram shows `🟢 Qwen Remote Control connected`. From then on, everything you do at the
-terminal appears there until you run `/qwen-remote` again, exit, resume or fork.
+Telegram shows `🟢 Qwen Remote Control connected`, followed by a digest of where the session is
+up to. From then on, everything you do at the terminal appears there until you run
+`/qwen-remote` again, exit, resume or fork.
+
+From the chat you can also send `/stop` to interrupt a turn, and agent commands like `/compact`,
+`/context` or `/model <name>`.
 
 ## Notes specific to this arrangement
 

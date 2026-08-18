@@ -36,7 +36,7 @@ The hook side never talks to the network. The bridge side never reads a hook.
 | Source | Rejected because |
 | --- | --- |
 | `capture-pane` scraping | ANSI/TUI chrome, reflow, and no stable identity for a message. |
-| Claude transcript tailing | Written per *record*, not per *delta* — it cannot stream, and it has no documented contract for partial text. Upstream uses it for the **Telegram-originated** path, which only needs completed messages. |
+| Claude transcript tailing | Written per *record*, not per *delta* — it cannot stream, and it has no documented contract for partial text. Upstream uses it for the **Telegram-originated** path, which only needs completed messages. This project reads it in exactly one place: the connect-time recap (below), once, on an explicit user action. |
 | Native Remote Control | [Documented](https://code.claude.com/docs/en/remote-control) as disabled when `ANTHROPIC_BASE_URL` is not `api.anthropic.com` — which is exactly this harness. |
 
 `MessageDisplay` is the documented, delta-level source of assistant text, with `session_id`,
@@ -52,11 +52,14 @@ The hook side never talks to the network. The bridge side never reads a hook.
 | `SessionEnd` | Real exits (`logout`, `prompt_input_exit`, …) clean up. `clear`/`resume` deliberately do **not** — they are followed by a `SessionStart`. |
 | `UserPromptSubmit` | Classify the turn's origin from `user_input`, and mirror terminal prompts. |
 | `MessageDisplay` | Stream assistant text. |
-| `PreToolUse` | Tool status bubble. |
+| `PreToolUse` | Tool status bubble — except for `AskUserQuestion`, which is a *blocking dialog*, not activity. |
+| `PostToolUse` | Registered with a matcher for blocking tools **only**: it tells us the human answered. `tool_output` is never read. |
 | `PostToolUseFailure` | Tool failure in the bubble. |
 | `PermissionRequest` | Ask the chat to decide (Allow/Deny buttons) and **block** on the answer; fall back to the terminal prompt if nobody presses one. |
 | `Notification` | `idle_prompt`, `agent_needs_input`, `agent_completed` only. `permission_prompt` is skipped — `PermissionRequest` already covers it. |
 | `SubagentStart` / `SubagentStop` | Subagent progress in the bubble. |
+| `PreCompact` / `PostCompact` | Explain the gap `/compact` leaves in the remote conversation. |
+| `Elicitation` / `ElicitationResult` | An MCP server is asking for input, and when it stops. |
 | `TaskCreated` / `TaskCompleted` | Task progress in the bubble. |
 | `Stop` | End the turn; finalize streamed messages; `last_assistant_message` as a **backstop only**. |
 | `StopFailure` | End the turn on an API error (`Stop` never fires); report `error_type` / `error_message`. |
@@ -67,8 +70,10 @@ hook is on Claude Code's critical path, and here Claude Code is already stopped 
 human. Registered with a `timeout` of the wait plus 30 s, so our own graceful fallback fires
 first rather than Claude Code killing the hook mid-wait.
 
-`PostToolUse` is deliberately **not** registered: the bubble already shows the call, and the
-event carries `tool_output`, which is both large and the most likely place for a secret to be.
+`PostToolUse` is registered **only** with a matcher for `AskUserQuestion` (`EVENT_MATCHERS`). It
+fires for every tool otherwise, and carries `tool_output`, which is both large and the likeliest
+place for a secret to appear — so it is scoped to the one thing we need from it: knowing that a
+blocking question was answered. The mirror never reads the output field.
 
 `Stop` and `StopFailure` additionally run upstream's own `agent2telegram.stop_hook`, which writes
 the bridge's `turn_end` marker. That keeps the **Telegram-originated** path's typing indicator
@@ -170,7 +175,33 @@ worse than no button at all.
 Two threads touch the pending-card map (the outbound one posts, the inbound one resolves), so
 it is the one piece of mirror state under a lock.
 
-### 5. Turn end
+### 5. Blocking dialogs
+
+`AskUserQuestion` and MCP elicitations *stop* the session rather than doing work, and Claude Code
+emits no turn end for them. Treating them as ordinary tool activity is what makes a phone show
+"typing…" forever next to a session that is really sitting on a picker.
+
+```
+PreToolUse(AskUserQuestion)  → spool {question, options, tool_use_id}
+   mirror: post a durable card, clear the tool bubble, and STOP the typing indicator
+           (working = true, waiting = non-empty ⇒ not typing)
+PostToolUse(AskUserQuestion) → spool {question_answered}
+   mirror: mark the card answered, resume typing
+turn end / interrupt         → any dialog still open is closed as "answered at the terminal"
+```
+
+The card cannot be answered from Telegram: the documented hook output for `PermissionRequest` is
+a `decision`, and there is no equivalent for supplying an *answer*. Rather than fake one with
+tmux keystrokes against a picker, the card reports the question and points at the keyboard.
+
+### 6. Interrupting from Telegram
+
+`/stop` sends the agent's own Escape to the tmux seat — a single press, because a double Escape
+opens Claude Code's history rewind. Claude Code fires neither `Stop` nor `StopFailure` for an
+interrupt, so the bridge spools an `interrupted` event itself rather than mutating mirror state
+from the inbound thread; the mirror ends every turn it is tracking for that seat.
+
+### 7. Turn end
 
 ```
 Stop → {turn_end}
@@ -183,7 +214,7 @@ Stop → {turn_end}
 The old "🖥️ Qwen finished + entire answer" message is gone: text arrives while the model works,
 and `Stop` adds nothing when it already did.
 
-### 6. Failure
+### 8. Failure
 
 ```
 StopFailure → {turn_failed}
@@ -302,6 +333,20 @@ anything is running and the heartbeat decides whether it is consuming; a running
 bridge is reported, never duplicated; an uninspectable process list falls back to trusting the
 heartbeat; and a lock file keeps two concurrent toggles from racing. A fresh heartbeat alone is
 not enough evidence — a bridge killed a second ago still has a one-second-old heartbeat.
+
+**Why sessions are tracked separately.** One bridge can mirror several Claude sessions, and the
+first cut kept a single `_live` map and a single "delivered" flag for the whole bridge. That is
+not merely untidy: session A's `Stop` would finalize session B's half-written message, and B's
+permission card would be retracted by A's turn ending. State is per session, the typing indicator
+is the OR across sessions, and a `[project]` label appears on messages only once more than one
+session is connected — a label on every line would be noise in the normal single-session case.
+
+**Why the recap reads a transcript at all.** Streaming from a transcript is the thing this design
+exists to avoid. Reading one *once*, when you connect, is a different operation with a different
+failure mode: it is bounded (the last megabyte), it happens on an explicit user action, and if it
+returns nothing the only cost is a missing digest. The window is deliberately generous because a
+real session's tail is mostly `tool_use`/`tool_result` records with no text — 256 KB of a
+tool-heavy transcript yielded a single lonely turn in testing, where 1 MB yielded the full six.
 
 **Why origin defaults to `terminal`.** A session becomes Telegram-driven only when a prefixed
 prompt actually arrives. Anything else — including events before the first prompt — belongs to

@@ -82,6 +82,24 @@ Mitigations:
 Redaction is a safety net for accidents, not a guarantee. Anyone with access to the Telegram
 account can read whatever the session displays — protect that account.
 
+## Driving the session from Telegram
+
+Beyond sending prompts, an allow-listed user can interrupt a turn (`/stop`) and run a fixed set
+of agent slash commands (`/compact`, `/model`, `/config`, …). Both are strictly weaker than the
+ability to send prompts, which that user already has. Two specifics:
+
+* the forwarded command set is an **allowlist**, not a passthrough of anything starting with `/`;
+* `/exit` is excluded on purpose — it would end the session in the tmux seat and take the remote
+  side down with it, which is a denial of service rather than a feature.
+
+## The connect-time recap
+
+Enabling mirroring sends a digest of the last few exchanges so a phone joining mid-session has
+context. This is the only transcript read in the project, and it means **connecting pushes some
+existing conversation to the chat**, not just future activity. It is bounded to the tail of the
+file and truncated per message, it happens only on your explicit action, and `--no-recap`
+disables it. If a session's history is more sensitive than its future, connect with `--no-recap`.
+
 ## What is stored on disk, and for how long
 
 Under `$AGENT2TELEGRAM_STATE/remote-control/` (default `~/.local/state/agent2telegram/`):

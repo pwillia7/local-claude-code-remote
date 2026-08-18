@@ -49,9 +49,21 @@ BOT_COMMANDS = [
     {"command": "start", "description": "Intro and what you can send"},
     {"command": "help", "description": "Intro and what you can send"},
     {"command": "status", "description": "Connection and voice status"},
+    {"command": "stop", "description": "Interrupt the running turn"},
+    {"command": "compact", "description": "Compact the conversation"},
+    {"command": "context", "description": "Show context usage"},
     {"command": "setkey", "description": "Enable voice (your ElevenLabs API key)"},
     {"command": "id", "description": "Show your Telegram id"},
 ]
+
+#: Agent slash commands we forward VERBATIM (no origin prefix), because the agent only treats a
+#: line as a command when the "/" is the very first character. Mirrors the set Claude Code's own
+#: Remote Control supports from mobile and web. `/exit` is deliberately absent: it would end the
+#: session in the tmux seat and take the remote side down with it.
+PASSTHROUGH_COMMANDS = {
+    "compact", "clear", "context", "usage", "recap", "reload-plugins",
+    "model", "effort", "fast", "color", "rename", "mcp", "config", "autocompact",
+}
 
 import re as _re  # noqa: E402
 from .readers import _short  # noqa: E402
@@ -593,7 +605,9 @@ class AttachBridge:
                 "progress, what tools it runs, and the reply. You can also send *photos* and "
                 "*files*, and react with ❤️ as quick feedback.\n\n"
                 f"🎤 Voice transcription: {voice}.\n\n"
-                "Commands: /help · /status · /id · /setkey")
+                "Commands: /help · /status · /stop · /id · /setkey\n"
+                "Agent commands work too: /compact, /clear, /context, /usage, "
+                "/model <name>, /effort <level>, /mcp, /config.")
             return True
         if cmd == "id":
             self.tg.send_message(chat_id, f"Your Telegram id: `{chat_id}`")
@@ -606,7 +620,67 @@ class AttachBridge:
             return True
         if cmd == "setkey":
             return self._set_voice_key(arg, chat_id, message_id)
+        if cmd in ("stop", "esc", "interrupt"):
+            return self._interrupt(chat_id)
+        if cmd in PASSTHROUGH_COMMANDS:
+            return self._passthrough_command(text, chat_id)
         return False    # unknown command → let the agent handle it
+
+    def _interrupt(self, chat_id: int) -> bool:
+        """Stop the running turn from Telegram — the agent's own Escape, not a kill."""
+        try:
+            self._session.interrupt()
+        except Exception as e:
+            log.error("interrupt failed: %s", e)
+            self.tg.send_message(chat_id, f"⚠️ Couldn't interrupt: {e}")
+            return True
+        # An interrupt produces no Stop or StopFailure, so tell the mirror explicitly or the
+        # chat would sit on "typing…" until the idle guard fires minutes later.
+        self._turn_active.clear()
+        self._status_clear()
+        self._note_remote_event({"type": "interrupted"})
+        self.tg.send_message(chat_id, "⏹️ Interrupted.")
+        log.info("TURN INTERRUPTED from Telegram")
+        return True
+
+    def _passthrough_command(self, text: str, chat_id: int) -> bool:
+        """Forward an agent slash command with no origin prefix, so the agent recognizes it."""
+        # The prefix is what marks a turn as Telegram-originated, so record the origin
+        # out-of-band instead; otherwise the mirror would echo it as if typed at the keyboard.
+        self._mark_remote_origin("telegram")
+        self._turn_from_tg = False        # these produce terminal-only output, not a reply
+        try:
+            self._session.inject_raw(text)
+        except Exception as e:
+            log.error("command injection failed: %s", e)
+            self.tg.send_message(chat_id, f"⚠️ Couldn't send that command: {e}")
+            return True
+        self.tg.send_message(chat_id,
+                             f"✅ Sent `{text}` to the session. Its output shows in the terminal; "
+                             "anything the agent says about it is mirrored here.")
+        return True
+
+    def _mark_remote_origin(self, origin: str) -> None:
+        """Set the Remote Control turn origin for every session mirrored through this bridge."""
+        if self._remote is None:
+            return
+        try:
+            from .remote_control import core as rc_core
+            for session_id in rc_core.sessions_for_bridge(self._remote.bridge):
+                rc_core.set_origin(self._remote.bridge, session_id, origin)
+        except Exception as e:
+            log.debug("could not record remote origin: %s", e)
+
+    def _note_remote_event(self, event: dict) -> None:
+        """Spool a mirror event from the bridge itself, so it is applied on the outbound
+        thread in order with everything else rather than mutating mirror state from here."""
+        if self._remote is None:
+            return
+        try:
+            from .remote_control import core as rc_core
+            rc_core.write_event(self._remote.bridge, {"session_id": "", **event})
+        except Exception as e:
+            log.debug("could not spool remote event: %s", e)
 
     def _set_voice_key(self, key: str, chat_id: int, message_id: int | None) -> bool:
         """Save an ElevenLabs key to enable voice, then delete the message so the secret isn't

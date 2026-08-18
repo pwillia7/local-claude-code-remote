@@ -115,15 +115,18 @@ Extra hard rules for that layer:
    `allowed_user_ids`, honour a request once, and treat a timeout as *no decision* (print
    nothing) rather than consent. Do not add `--dangerously-skip-permissions`, do not change the
    permission mode, do not simulate an approval with tmux keystrokes.
-5. **Never retain event payloads.** A spool file is deleted as soon as it has been applied. Do
+5. **The transcript is not a live source.** The connect-time recap in `core.recap` is the single
+   permitted read, it is bounded, and it runs on an explicit user action. Do not add a second
+   one, and never put transcript reading on the streaming path.
+6. **Never retain event payloads.** A spool file is deleted as soon as it has been applied. Do
    not log message content — log types, counts and ids only.
-6. **Never start a second Telegram poller.** Telegram gives each update to exactly one
+7. **Never start a second Telegram poller.** Telegram gives each update to exactly one
    `getUpdates` consumer, so two bridges make messages disappear at random. When in doubt about
    whether one is running, do nothing and say so — see `remote_control/supervise.py`.
-7. **The installer is additive.** It merges its own hook entries into `settings.json`, backs the
+8. **The installer is additive.** It merges its own hook entries into `settings.json`, backs the
    file up first, and must leave every other hook byte-for-byte alone. Keep it idempotent, and
    keep `uninstall` symmetrical with `install`.
-8. **No machine-specific paths in the package.** `$HOME`, a tmux session name or a CCR profile
+9. **No machine-specific paths in the package.** `$HOME`, a tmux session name or a CCR profile
    name belong in configuration, the installer's arguments, or `examples/` — never in source.
 
 Run the whole suite with `python3 -m unittest discover -s tests -v` (stdlib only, no network)

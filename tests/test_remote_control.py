@@ -21,6 +21,15 @@ from agent2telegram.remote_control.mirror import RemoteControlMirror
 from agent2telegram.telegram import markdown_to_html
 
 
+def _mirror_for(chat):
+    """A mirror wired to a fake chat — the same wiring AttachBridge does."""
+    return RemoteControlMirror(
+        BRIDGE, send_plain_id=chat.send_plain_id, edit_plain=chat.edit_plain,
+        send_text=chat.send_text, status_push=chat.status_push,
+        status_clear=chat.status_clear, set_active=chat.set_active,
+        answer_callback_query=chat.answer_callback_query)
+
+
 def rendered(*texts):
     """What the mirror is expected to put on the wire: the agent's Markdown as Telegram HTML."""
     return [markdown_to_html(t) for t in texts]
@@ -348,11 +357,7 @@ class MirrorTests(_StateCase):
     def setUp(self) -> None:
         super().setUp()
         self.chat = _FakeChat()
-        self.mirror = RemoteControlMirror(
-            BRIDGE, send_plain_id=self.chat.send_plain_id, edit_plain=self.chat.edit_plain,
-            send_text=self.chat.send_text, status_push=self.chat.status_push,
-            status_clear=self.chat.status_clear, set_active=self.chat.set_active,
-            answer_callback_query=self.chat.answer_callback_query)
+        self.mirror = _mirror_for(self.chat)
         self._interval = mirror_mod.EDIT_INTERVAL
         mirror_mod.EDIT_INTERVAL = 0.0            # deterministic: never defer an edit
         self.addCleanup(self._restore_interval)
@@ -383,7 +388,7 @@ class MirrorTests(_StateCase):
         self.display("m1", "Answer", final=True)
         self.mirror.tick()
         self.assertEqual(self.chat.stream(), ["Answer"])
-        self.assertEqual(self.mirror._live, {})
+        self.assertEqual(self.mirror._session(SID).live, {})
 
     def test_empty_final_delta_still_finalizes(self):
         self.display("m1", "Partial")
@@ -391,7 +396,7 @@ class MirrorTests(_StateCase):
         self.display("m1", "", final=True)
         self.mirror.tick()
         self.assertEqual(self.chat.stream(), ["Partial"])
-        self.assertEqual(self.mirror._live, {})
+        self.assertEqual(self.mirror._session(SID).live, {})
 
     def test_multiple_message_ids_stay_independent(self):
         self.display("m1", "first")
@@ -538,7 +543,7 @@ class MirrorTests(_StateCase):
         self.mirror.tick()
         self.assertEqual(self.chat.active[-1], False)
         self.assertEqual(self.chat.stream(), ["working…"])       # partial text is kept
-        self.assertEqual(self.mirror._live, {})
+        self.assertEqual(self.mirror._session(SID).live, {})
 
     def test_stop_failure_ends_the_turn_without_stop(self):
         self.display("m1", "started…")
@@ -550,7 +555,7 @@ class MirrorTests(_StateCase):
         self.assertIn("upstream is busy", self.chat.sent_text[0])
         self.assertGreater(self.chat.cleared, 0)
         self.assertEqual(self.chat.active[-1], False)
-        self.assertEqual(self.mirror._live, {})
+        self.assertEqual(self.mirror._session(SID).live, {})
 
 
 # --------------------------------------------------------------------------- permissions
@@ -561,11 +566,7 @@ class PermissionApprovalTests(_StateCase):
     def setUp(self) -> None:
         super().setUp()
         self.chat = _FakeChat()
-        self.mirror = RemoteControlMirror(
-            BRIDGE, send_plain_id=self.chat.send_plain_id, edit_plain=self.chat.edit_plain,
-            send_text=self.chat.send_text, status_push=self.chat.status_push,
-            status_clear=self.chat.status_clear, set_active=self.chat.set_active,
-            answer_callback_query=self.chat.answer_callback_query)
+        self.mirror = _mirror_for(self.chat)
         self.enable()
         core.touch_heartbeat(BRIDGE)          # a bridge is listening
 
@@ -722,7 +723,7 @@ class PermissionApprovalTests(_StateCase):
         self.mirror.tick()
         mid = next(iter(self.chat.keyboards))
         self.mirror._pending_perms[  # re-open it as if it were still awaiting an answer
-            core.slug("x")] = {"mid": mid, "ts": 0.0}
+            core.slug("x")] = {"mid": mid, "ts": 0.0, "session": SID}
         self.hook("Stop", last_assistant_message="done")
         self.mirror.tick()
         self.assertEqual(self.mirror._pending_perms, {})
@@ -752,11 +753,7 @@ class MarkdownTests(_StateCase):
     def setUp(self) -> None:
         super().setUp()
         self.chat = _FakeChat()
-        self.mirror = RemoteControlMirror(
-            BRIDGE, send_plain_id=self.chat.send_plain_id, edit_plain=self.chat.edit_plain,
-            send_text=self.chat.send_text, status_push=self.chat.status_push,
-            status_clear=self.chat.status_clear, set_active=self.chat.set_active,
-            answer_callback_query=self.chat.answer_callback_query)
+        self.mirror = _mirror_for(self.chat)
         self._interval = mirror_mod.EDIT_INTERVAL
         mirror_mod.EDIT_INTERVAL = 0.0
         self.addCleanup(setattr, mirror_mod, "EDIT_INTERVAL", self._interval)
@@ -824,11 +821,7 @@ class SpoolTests(_StateCase):
         self.enable()
 
     def _mirror(self, chat: _FakeChat) -> RemoteControlMirror:
-        return RemoteControlMirror(
-            BRIDGE, send_plain_id=chat.send_plain_id, edit_plain=chat.edit_plain,
-            send_text=chat.send_text, status_push=chat.status_push,
-            status_clear=chat.status_clear, set_active=chat.set_active,
-            answer_callback_query=chat.answer_callback_query)
+        return _mirror_for(chat)
 
     def test_events_are_ordered(self):
         for i in range(30):
@@ -878,6 +871,299 @@ class SpoolTests(_StateCase):
         chat = _FakeChat()
         self._mirror(chat).tick()
         self.assertLessEqual(core.pending_count(BRIDGE), mirror_mod.DROP_ABOVE)
+
+
+# --------------------------------------------------------------------------- blocking dialogs
+
+class BlockingDialogTests(_StateCase):
+    """A session that has STOPPED to ask must not look like a session that is working."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.chat = _FakeChat()
+        self.mirror = _mirror_for(self.chat)
+        self.enable()
+
+    QUESTION = {"questions": [{"header": "Approach", "question": "Which way?",
+                               "options": [{"label": "Rewrite", "description": "start over"},
+                                           {"label": "Patch", "description": "minimal"}],
+                               "multiSelect": False}]}
+
+    def test_ask_user_question_is_reported_not_treated_as_a_tool(self):
+        self.hook("PreToolUse", tool_name="AskUserQuestion", tool_input=self.QUESTION,
+                  tool_use_id="tu1")
+        self.assertEqual(self.kinds(), ["question"])
+        self.mirror.tick()
+        card = self.chat.messages[self.chat.order[0]]
+        self.assertIn("Waiting for your answer", card)
+        self.assertIn("Which way?", card)
+        self.assertIn("1. Rewrite", card)
+        self.assertIn("2. Patch", card)
+        self.assertEqual(self.chat.status, [])      # not a transient tool bubble
+
+    def test_typing_stops_while_the_session_is_blocked(self):
+        self.display_working()
+        self.assertEqual(self.chat.active[-1], True)
+        self.hook("PreToolUse", tool_name="AskUserQuestion", tool_input=self.QUESTION,
+                  tool_use_id="tu1")
+        self.mirror.tick()
+        self.assertEqual(self.chat.active[-1], False)   # waiting for a human, not working
+
+    def test_typing_resumes_once_the_question_is_answered(self):
+        self.display_working()
+        self.hook("PreToolUse", tool_name="AskUserQuestion", tool_input=self.QUESTION,
+                  tool_use_id="tu1")
+        self.mirror.tick()
+        self.hook("PostToolUse", tool_name="AskUserQuestion", tool_use_id="tu1")
+        self.mirror.tick()
+        self.assertEqual(self.chat.active[-1], True)
+        self.assertIn("Answered at the terminal", self.chat.messages[self.chat.order[-1]])
+
+    def test_post_tool_use_for_ordinary_tools_is_ignored(self):
+        # Registered with a matcher, but never trust the matcher for something this noisy.
+        self.hook("PostToolUse", tool_name="Bash", tool_use_id="tu9",
+                  tool_output="secret output")
+        self.assertEqual(self.kinds(), [])
+
+    def test_question_text_is_redacted_and_capped(self):
+        self.hook("PreToolUse", tool_name="AskUserQuestion", tool_use_id="tu1",
+                  tool_input={"questions": [{"header": "h", "question": "use API_TOKEN=abc123xyz789?",
+                                             "options": [{"label": "y" * 300}]}]})
+        ev = self.events()[0]
+        self.assertNotIn("abc123xyz789", json.dumps(ev))
+        self.assertLessEqual(len(ev["questions"][0]["options"][0]), 61)
+
+    def test_mcp_elicitation_is_surfaced_and_cleared(self):
+        self.hook("Elicitation", server_name="vault", elicitation_id="e1",
+                  prompt="Which secret do you want?")
+        self.mirror.tick()
+        self.assertIn("vault", self.chat.messages[self.chat.order[0]])
+        self.hook("ElicitationResult", elicitation_id="e1", user_response="x")
+        self.mirror.tick()
+        self.assertIn("Answered at the terminal", self.chat.messages[self.chat.order[0]])
+
+    def test_turn_end_closes_an_unanswered_dialog(self):
+        self.hook("PreToolUse", tool_name="AskUserQuestion", tool_input=self.QUESTION,
+                  tool_use_id="tu1")
+        self.hook("Stop", last_assistant_message="")
+        self.mirror.tick()
+        self.assertEqual(self.mirror._session(SID).waiting, {})
+
+    def display_working(self):
+        self.hook("MessageDisplay", message_id="m1", turn_id="t1", index=0,
+                  delta="thinking…", final=False)
+        self.mirror.tick()
+
+
+# --------------------------------------------------------------------------- compaction
+
+class CompactionTests(_StateCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.chat = _FakeChat()
+        self.mirror = _mirror_for(self.chat)
+        self.enable()
+
+    def test_compaction_is_explained_rather_than_a_silent_gap(self):
+        self.hook("PreCompact", trigger="auto")
+        self.mirror.tick()
+        self.assertIn("Compacting", self.chat.status[-1])
+        self.hook("PostCompact", trigger="auto")
+        self.mirror.tick()
+        self.assertIn("compacted", self.chat.sent_text[-1])
+        self.assertIn("auto", self.chat.sent_text[-1])
+
+    def test_compaction_does_not_disconnect(self):
+        self.hook("PreCompact", trigger="manual")
+        self.hook("PostCompact", trigger="manual")
+        self.hook("SessionStart", source="compact")
+        self.assertTrue(core.is_enabled(SID))
+
+
+# --------------------------------------------------------------------------- recap
+
+class RecapTests(_StateCase):
+    def _transcript(self, session_id, cwd, records):
+        d = Path(self._tmp.name) / "claude" / "projects" / cwd.replace("/", "-")
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{session_id}.jsonl").write_text(
+            "\n".join(json.dumps(r) for r in records) + "\n", encoding="utf-8")
+        os.environ["CLAUDE_CONFIG_DIR"] = str(Path(self._tmp.name) / "claude")
+        self.addCleanup(os.environ.pop, "CLAUDE_CONFIG_DIR", None)
+
+    @staticmethod
+    def _msg(kind, text):
+        return {"type": kind, "message": {"content": [{"type": "text", "text": text}]}}
+
+    def test_recap_summarizes_the_recent_conversation(self):
+        self._transcript(SID, "/work/proj", [
+            {"type": "summary"},
+            self._msg("user", "first question"),
+            self._msg("assistant", "first answer"),
+            {"type": "user", "message": {"content": [{"type": "tool_result", "text": "ignored"}]}},
+            self._msg("user", "second question"),
+            self._msg("assistant", "second answer"),
+        ])
+        text = core.recap(SID, "/work/proj")
+        self.assertIn("second question", text)
+        self.assertIn("second answer", text)
+        self.assertNotIn("ignored", text)          # tool results are not conversation
+
+    def test_recap_keeps_only_the_last_few_and_truncates_them(self):
+        self._transcript(SID, "/work/proj",
+                         [self._msg("assistant", f"msg{i} " + "x" * 2000) for i in range(20)])
+        text = core.recap(SID, "/work/proj", limit=2)
+        self.assertEqual(text.count("🤖:"), 2)
+        self.assertLess(len(text), 2 * (core.RECAP_CHARS + 40))
+
+    def test_recap_survives_a_tail_full_of_tool_records(self):
+        # A real transcript's tail is mostly tool_use/tool_result with no text; the window has
+        # to be big enough to reach actual conversation or the digest is one lonely line.
+        records = []
+        for i in range(6):
+            records.append(self._msg("user", f"question {i}"))
+            records.append(self._msg("assistant", f"answer {i}"))
+            records.append({"type": "user", "message": {"content": [
+                {"type": "tool_result", "text": "T" * 30000}]}})
+        self._transcript(SID, "/work/proj", records)
+        text = core.recap(SID, "/work/proj")
+        self.assertEqual(text.count("🖥️ You:") + text.count("🤖:"), core.RECAP_MESSAGES)
+        self.assertIn("answer 5", text)
+
+    def test_recap_is_empty_when_there_is_no_transcript(self):
+        self.assertEqual(core.recap(SID, "/nowhere"), "")
+        self.assertEqual(core.recap("", "/work/proj"), "")
+
+    def test_recap_reaches_telegram_as_a_digest(self):
+        self.enable()
+        core.write_event(BRIDGE, {"type": "recap", "session_id": SID,
+                                  "text": "🖥️ You: hi\n\n🤖: hello", "cwd": "/work/proj"})
+        chat = _FakeChat()
+        _mirror_for(chat).tick()
+        self.assertIn("Where this session is up to", chat.sent_text[0])
+        self.assertIn("hello", chat.sent_text[0])
+
+
+# --------------------------------------------------------------------------- multi-session
+
+class MultiSessionTests(_StateCase):
+    """Two sessions on one bridge must not share state or interleave unlabelled."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.chat = _FakeChat()
+        self.mirror = _mirror_for(self.chat)
+        self._interval = mirror_mod.EDIT_INTERVAL
+        mirror_mod.EDIT_INTERVAL = 0.0
+        self.addCleanup(setattr, mirror_mod, "EDIT_INTERVAL", self._interval)
+        core.bind_session(SID, bridge=BRIDGE, cwd="/work/alpha")
+        core.bind_session(OTHER, bridge=BRIDGE, cwd="/work/beta")
+
+    def _display(self, sid, mid, delta, final=False):
+        core.handle({"hook_event_name": "MessageDisplay", "session_id": sid,
+                     "message_id": mid, "turn_id": "t", "index": 0,
+                     "delta": delta, "final": final})
+
+    def test_each_session_gets_its_own_message(self):
+        self._display(SID, "m1", "alpha speaking")
+        self._display(OTHER, "m1", "beta speaking")     # same message_id, different session
+        self.mirror.tick()
+        self.assertEqual(len(self.chat.order), 2)
+
+    def test_messages_are_labelled_when_two_sessions_are_mirrored(self):
+        self._display(SID, "m1", "alpha speaking", final=True)
+        self.mirror.tick()
+        self.assertIn("[alpha]", self.chat.stream()[0])
+
+    def test_one_session_is_not_labelled(self):
+        core.unbind_session(OTHER)
+        self._display(SID, "m1", "alone", final=True)
+        self.mirror.tick()
+        self.assertNotIn("[", self.chat.stream()[0])
+
+    def test_one_sessions_turn_end_does_not_finalize_the_other(self):
+        self._display(SID, "m1", "alpha still typing")
+        self._display(OTHER, "m2", "beta still typing")
+        self.mirror.tick()
+        core.handle({"hook_event_name": "Stop", "session_id": SID,
+                     "last_assistant_message": "alpha done"})
+        self.mirror.tick()
+        self.assertEqual(self.mirror._session(SID).live, {})
+        self.assertNotEqual(self.mirror._session(OTHER).live, {})   # untouched
+
+    def test_typing_stays_on_while_the_other_session_works(self):
+        self._display(SID, "m1", "alpha")
+        self._display(OTHER, "m2", "beta")
+        self.mirror.tick()
+        self.assertEqual(self.chat.active[-1], True)
+        core.handle({"hook_event_name": "Stop", "session_id": SID, "last_assistant_message": ""})
+        self.mirror.tick()
+        self.assertEqual(self.chat.active[-1], True)     # beta is still going
+        core.handle({"hook_event_name": "Stop", "session_id": OTHER, "last_assistant_message": ""})
+        self.mirror.tick()
+        self.assertEqual(self.chat.active[-1], False)
+
+    def test_a_permission_card_is_retracted_only_for_its_own_session(self):
+        core.touch_heartbeat(BRIDGE)
+        core.write_event(BRIDGE, {"type": "permission_request", "session_id": OTHER,
+                                  "request_id": "r1", "tool_name": "Bash", "summary": "x"})
+        self.mirror.tick()
+        mid = next(iter(self.chat.keyboards))
+        core.handle({"hook_event_name": "Stop", "session_id": SID, "last_assistant_message": ""})
+        self.mirror.tick()
+        self.assertNotEqual(self.chat.keyboards[mid], mirror_mod.NO_KEYBOARD)  # still live
+        core.handle({"hook_event_name": "Stop", "session_id": OTHER, "last_assistant_message": ""})
+        self.mirror.tick()
+        self.assertEqual(self.chat.keyboards[mid], mirror_mod.NO_KEYBOARD)
+
+
+# --------------------------------------------------------------------------- interrupt
+
+class InterruptTests(_StateCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.chat = _FakeChat()
+        self.mirror = _mirror_for(self.chat)
+        self.enable()
+
+    def test_interrupt_ends_the_turn_that_stop_will_never_end(self):
+        self.hook("MessageDisplay", message_id="m1", turn_id="t1", index=0,
+                  delta="half an answer", final=False)
+        self.mirror.tick()
+        self.assertEqual(self.chat.active[-1], True)
+        core.write_event(BRIDGE, {"type": "interrupted", "session_id": ""})
+        self.mirror.tick()
+        self.assertEqual(self.chat.active[-1], False)
+        self.assertEqual(self.chat.stream(), rendered("half an answer"))  # partial text kept
+        self.assertEqual(self.mirror._session(SID).live, {})
+
+    def test_passthrough_command_set_matches_what_the_agent_understands(self):
+        from agent2telegram.attach import PASSTHROUGH_COMMANDS
+        for cmd in ("compact", "clear", "context", "model", "effort", "mcp", "config"):
+            self.assertIn(cmd, PASSTHROUGH_COMMANDS)
+        # /exit would end the session in the tmux seat and take the remote side down with it.
+        self.assertNotIn("exit", PASSTHROUGH_COMMANDS)
+
+    def test_raw_injection_does_not_prepend_the_origin_prefix(self):
+        from agent2telegram.session import TmuxSession
+        sent = []
+
+        class _Fake(TmuxSession):
+            def __init__(self):                      # bypass the tmux existence check
+                self._origin = "[TG] "
+                self.name = "x"
+
+            def _send_keys(self, text):
+                sent.append((self._origin, text))
+
+            @property
+            def alive(self):
+                return True
+
+        fake = _Fake()
+        fake.inject_raw("/compact")
+        self.assertEqual(sent, [("", "/compact")])
+        self.assertEqual(fake._origin, "[TG] ")      # restored afterwards
 
 
 # --------------------------------------------------------------------------- bridge start

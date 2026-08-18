@@ -115,6 +115,26 @@ class TmuxSession:
             raise SessionError(f"agent session '{self.name}' is gone")
         self._send_keys(text)
 
+    def inject_raw(self, text: str) -> None:
+        """Type *text* with NO origin prefix — for slash commands, which the agent only
+        recognizes at the very start of the line."""
+        if not self.alive:
+            raise SessionError(f"agent session '{self.name}' is gone")
+        origin, self._origin = self._origin, ""
+        try:
+            self._send_keys(text)
+        finally:
+            self._origin = origin
+
+    def interrupt(self) -> None:
+        """Send Escape — the agent's own interrupt — to stop a running turn.
+
+        Deliberately a single press: a double Escape opens the history rewind picker in Claude
+        Code, which is not what "stop" should do from a phone."""
+        if not self.alive:
+            raise SessionError(f"agent session '{self.name}' is gone")
+        _tmux("send-keys", "-t", self.name, "Escape")
+
     def send(self, text: str) -> str:
         if not self.alive:
             raise SessionError(f"agent session '{self.name}' is gone")

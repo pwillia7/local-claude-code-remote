@@ -55,8 +55,9 @@ MAX_PENDING = 500
 #: Hook events we translate into mirror events. Anything else is ignored.
 HOOK_EVENTS = (
     "SessionStart", "SessionEnd", "UserPromptSubmit", "MessageDisplay",
-    "PreToolUse", "PostToolUseFailure", "PermissionRequest", "Notification",
+    "PreToolUse", "PostToolUse", "PostToolUseFailure", "PermissionRequest", "Notification",
     "SubagentStart", "SubagentStop", "TaskCreated", "TaskCompleted",
+    "PreCompact", "PostCompact", "Elicitation", "ElicitationResult",
     "Stop", "StopFailure",
 )
 
@@ -68,6 +69,21 @@ RESET_SOURCES = ("startup", "resume", "fork")
 #: immediately followed by SessionStart, and tearing state down there would disconnect a user
 #: who only typed /clear.
 NON_TERMINAL_END_REASONS = ("clear", "resume")
+
+#: Tools that BLOCK the session on a human answer instead of running. Claude Code emits no
+#: turn-end for them, so without special handling the chat shows a session that looks busy
+#: forever while it is really waiting at the keyboard.
+BLOCKING_TOOLS = ("AskUserQuestion",)
+
+#: How much transcript the connect-time recap may read, and how much of it to keep. This is
+#: the ONLY place this project reads a transcript, and it is a one-off on an explicit user
+#: action — the live mirror is driven entirely by hooks.
+#: Generous on purpose: a real session's tail is mostly tool_use and tool_result records with
+#: no text at all, so a small window yields one lonely turn instead of a usable digest. Read
+#: once, on connect, so a megabyte costs nothing.
+RECAP_TAIL_BYTES = 1024 * 1024
+RECAP_MESSAGES = 6
+RECAP_CHARS = 400
 
 #: Notification types worth a remote message. ``permission_prompt`` is deliberately absent:
 #: PermissionRequest already covers it and we do not want the same event twice.
@@ -196,7 +212,7 @@ def _read_json(path: str):
 
 def bind_session(session_id: str, *, bridge: str, config_path: str = "",
                  origins=(), label: str = "", permissions: bool = True,
-                 permission_timeout: float = PERMISSION_TIMEOUT) -> None:
+                 permission_timeout: float = PERMISSION_TIMEOUT, cwd: str = "") -> None:
     """Turn Remote Control ON for one Claude session.
 
     The binding file is the hook's fast path: one ``open()`` tells it whether this session is
@@ -209,6 +225,7 @@ def bind_session(session_id: str, *, bridge: str, config_path: str = "",
         "config": config_path,
         "origins": prefixes,
         "label": label,
+        "cwd": cwd,
         "permissions": bool(permissions),
         "permission_timeout": float(permission_timeout),
         "since": time.time(),
@@ -242,6 +259,28 @@ def session_binding(session_id: str):
 
 def is_enabled(session_id: str) -> bool:
     return session_binding(session_id) is not None
+
+
+def sessions_for_bridge(bridge: str) -> dict:
+    """Every session currently mirrored through *bridge*, as ``{session_id: binding}``.
+
+    The mirror uses the count to decide whether messages need a session label: one session is
+    the normal case and a label would be noise, two or more and an unlabelled stream is
+    unreadable."""
+    out = {}
+    d = sessions_dir()
+    want = slug(bridge)
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return out
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        data = _read_json(os.path.join(d, name))
+        if isinstance(data, dict) and data.get("bridge") == want:
+            out[name[:-5]] = data
+    return out
 
 
 # --------------------------------------------------------------------------- origin
@@ -452,6 +491,31 @@ def subagent_summary(agent_type: str) -> str:
     return "🤖 " + short(agent_type or "subagent") + " running"
 
 
+def question_summary(inp) -> dict:
+    """Flatten an ``AskUserQuestion`` input into something safe to show in a chat.
+
+    Model-authored text, so every field is redacted and capped. Only the question text and the
+    option *labels* are taken — never the free-form option descriptions, which are long and add
+    nothing to "what is this session waiting for?".
+    """
+    inp = inp if isinstance(inp, dict) else {}
+    questions = inp.get("questions")
+    questions = questions if isinstance(questions, list) else []
+    out = []
+    for q in questions[:3]:
+        if not isinstance(q, dict):
+            continue
+        options = [short(redact(o.get("label", "")), 60)
+                   for o in (q.get("options") or [])[:6] if isinstance(o, dict)]
+        out.append({
+            "header": short(redact(q.get("header", "")), 40),
+            "question": short(redact(q.get("question", "")), 240),
+            "options": [o for o in options if o],
+            "multi": bool(q.get("multiSelect")),
+        })
+    return {"questions": out}
+
+
 def permission_detail(name: str, inp) -> str:
     """A few extra lines of context for an approval card.
 
@@ -476,6 +540,83 @@ def permission_detail(name: str, inp) -> str:
         # MCP arguments are arbitrary and server-defined: name the fields, never their values.
         return "arguments: " + short(", ".join(sorted(inp)) or "none", 200)
     return ""
+
+
+# --------------------------------------------------------------------------- connect recap
+
+def _projects_dirs():
+    """Where Claude Code keeps per-project transcripts (honouring CLAUDE_CONFIG_DIR)."""
+    out = []
+    cfg = os.environ.get("CLAUDE_CONFIG_DIR")
+    if cfg:
+        out.append(os.path.join(os.path.expanduser(cfg), "projects"))
+    out.append(os.path.expanduser(os.path.join("~", ".claude", "projects")))
+    return out
+
+
+def transcript_for(session_id: str, cwd: str) -> str:
+    """Path to a session's transcript, or "" — Claude Code stores it per working directory."""
+    if not session_id or not cwd:
+        return ""
+    for base in _projects_dirs():
+        for candidate in {cwd, os.path.realpath(cwd)}:
+            path = os.path.join(base, candidate.replace("/", "-"), session_id + ".jsonl")
+            if os.path.exists(path):
+                return path
+    return ""
+
+
+def _record_text(rec: dict) -> str:
+    content = (rec.get("message") or {}).get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(b.get("text", "") for b in content
+                          if isinstance(b, dict) and b.get("type") == "text")
+    return ""
+
+
+def recap(session_id: str, cwd: str, limit: int = RECAP_MESSAGES) -> str:
+    """A short "here is where you are" digest of the conversation so far, or "".
+
+    Connecting mid-session otherwise drops you into a stream with no context. This is the only
+    transcript read in the project: a one-off, on an explicit user action, bounded to the tail
+    of the file — the live mirror never touches it.
+    """
+    path = transcript_for(session_id, cwd)
+    if not path:
+        return ""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            f.seek(max(0, size - RECAP_TAIL_BYTES))
+            tail = f.read()
+    except OSError:
+        return ""
+    turns = []
+    for raw in tail.split(b"\n")[1:]:            # first line may be a partial record
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line.decode("utf-8", "ignore"))
+        except (ValueError, TypeError):
+            continue
+        kind = rec.get("type")
+        if kind not in ("user", "assistant"):
+            continue
+        text = _record_text(rec).strip()
+        if not text:
+            continue                              # tool results and tool calls carry no text
+        turns.append((kind, text))
+    if not turns:
+        return ""
+    lines = []
+    for kind, text in turns[-limit:]:
+        who = "🖥️ You" if kind == "user" else "🤖"
+        body = text if len(text) <= RECAP_CHARS else text[:RECAP_CHARS - 1] + "…"
+        lines.append(f"{who}: {body}")
+    return "\n\n".join(lines)
 
 
 # --------------------------------------------------------------------------- hook adapter
@@ -594,7 +735,7 @@ def handle(payload: dict):
         origin = classify_origin(text, binding.get("origins") or ())
         set_origin(bridge, session_id, origin, payload.get("prompt_id", ""))
         if origin == "terminal":
-            _emit(bridge, session_id, "prompt", text=text)
+            _emit(bridge, session_id, "prompt", text=text, cwd=payload.get("cwd", ""))
         return None
 
     # Everything below mirrors the LOCAL seat only. Telegram-originated turns are already
@@ -610,9 +751,23 @@ def handle(payload: dict):
               delta=payload.get("delta", "") or "",
               final=bool(payload.get("final")))
     elif event == "PreToolUse":
-        _emit(bridge, session_id, "tool",
-              summary=tool_summary(payload.get("tool_name", ""), payload.get("tool_input")),
-              tool_use_id=payload.get("tool_use_id", ""))
+        tool = payload.get("tool_name", "")
+        if tool in BLOCKING_TOOLS:
+            # Claude Code stops here until a human answers, and emits no turn end. Say so, or
+            # the chat shows a session that looks busy forever.
+            _emit(bridge, session_id, "question",
+                  tool_use_id=payload.get("tool_use_id", ""), tool_name=short(tool, 40),
+                  **question_summary(payload.get("tool_input")))
+        else:
+            _emit(bridge, session_id, "tool",
+                  summary=tool_summary(tool, payload.get("tool_input")),
+                  tool_use_id=payload.get("tool_use_id", ""))
+    elif event == "PostToolUse":
+        # Registered for the blocking tools ONLY (see install.EVENT_MATCHERS): it tells us the
+        # human answered. tool_output is deliberately never read.
+        if payload.get("tool_name", "") in BLOCKING_TOOLS:
+            _emit(bridge, session_id, "question_answered",
+                  tool_use_id=payload.get("tool_use_id", ""))
     elif event == "PostToolUseFailure":
         _emit(bridge, session_id, "tool_failed",
               summary=tool_summary(payload.get("tool_name", ""), payload.get("tool_input")),
@@ -635,6 +790,18 @@ def handle(payload: dict):
     elif event == "TaskCompleted":
         _emit(bridge, session_id, "task_completed",
               task_name=short(redact(payload.get("task_name", "")), 80))
+    elif event == "PreCompact":
+        _emit(bridge, session_id, "compact_start", trigger=short(payload.get("trigger", ""), 20))
+    elif event == "PostCompact":
+        _emit(bridge, session_id, "compact_end", trigger=short(payload.get("trigger", ""), 20))
+    elif event == "Elicitation":
+        _emit(bridge, session_id, "elicitation",
+              elicitation_id=short(payload.get("elicitation_id", ""), 64),
+              server_name=short(payload.get("server_name", ""), 40),
+              prompt=short(redact(payload.get("prompt", "")), 240))
+    elif event == "ElicitationResult":
+        _emit(bridge, session_id, "elicitation_done",
+              elicitation_id=short(payload.get("elicitation_id", ""), 64))
     elif event == "Stop":
         _emit(bridge, session_id, "turn_end",
               last_assistant_message=payload.get("last_assistant_message", "") or "")

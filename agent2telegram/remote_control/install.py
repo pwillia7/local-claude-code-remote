@@ -30,6 +30,7 @@ EVENT_TIMEOUTS = {
     "UserPromptSubmit": 5,
     "MessageDisplay": 5,
     "PreToolUse": 5,
+    "PostToolUse": 5,                # blocking dialogs only — see EVENT_MATCHERS
     "PostToolUseFailure": 5,
     "PermissionRequest": 5,          # replaced at install time — this one deliberately waits
     "Notification": 5,
@@ -37,8 +38,19 @@ EVENT_TIMEOUTS = {
     "SubagentStop": 5,
     "TaskCreated": 5,
     "TaskCompleted": 5,
+    "PreCompact": 5,
+    "PostCompact": 5,
+    "Elicitation": 5,
+    "ElicitationResult": 5,
     "Stop": 5,
     "StopFailure": 5,
+}
+
+#: Events we scope with a matcher rather than taking every occurrence. ``PostToolUse`` fires for
+#: every tool and carries ``tool_output``, which is large and the likeliest place for a secret —
+#: we want it only to learn that a blocking question was answered.
+EVENT_MATCHERS = {
+    "PostToolUse": "|".join(core.BLOCKING_TOOLS),
 }
 
 #: Headroom on top of the remote-approval wait, so OUR timeout fires first and falls back to
@@ -271,7 +283,10 @@ def install(args) -> int:
         entries = [{"type": "command", "command": rc_cmd, "timeout": timeout}]
         if event in STOP_EVENTS:
             entries.insert(0, {"type": "command", "command": stop_cmd, "timeout": 15})
-        groups.append({"hooks": entries})
+        group = {"hooks": entries}
+        if event in EVENT_MATCHERS:
+            group = {"matcher": EVENT_MATCHERS[event], **group}
+        groups.append(group)
         hooks[event] = groups
 
     # Let the Skill's helper run without a permission prompt (additive, deduped).

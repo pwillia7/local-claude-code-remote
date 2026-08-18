@@ -144,11 +144,21 @@ def cmd_toggle(args) -> int:
             warning = message
 
     permissions = not getattr(args, "no_permission_prompts", False)
+    cwd = os.getcwd()                       # the Skill runs inside the session, so this is its cwd
     core.bind_session(session_id, bridge=bridge, config_path=str(cfg_path),
-                      origins=_origins(cfg), label=args.label,
+                      origins=_origins(cfg), label=args.label, cwd=cwd,
                       permissions=permissions,
                       permission_timeout=getattr(args, "permission_timeout",
                                                  core.PERMISSION_TIMEOUT))
+    # Connecting mid-session otherwise drops the phone into a stream with no context.
+    if not getattr(args, "no_recap", False):
+        try:
+            text = core.recap(session_id, cwd)
+            if text:
+                core.write_event(bridge, {"type": "recap", "session_id": session_id,
+                                          "text": text, "cwd": cwd})
+        except Exception:
+            pass                            # a missing recap must never block connecting
     extra = ("\nPermission requests can be approved from here."
              if permissions else "\nPermission requests are notification-only.")
     ok = _notify(cfg, f"🟢 **{args.label} connected**\n\n"
@@ -233,6 +243,8 @@ def add_parser(sub) -> None:
                             f"the terminal prompt (default: {core.PERMISSION_TIMEOUT:.0f})")
         p.add_argument("--no-bridge-start", action="store_true",
                        help="do not start the Agent2Telegram bridge if it is not running")
+        p.add_argument("--no-recap", action="store_true",
+                       help="do not send a digest of the conversation so far on connect")
         return p
 
     _common(rcs.add_parser("toggle", help="turn mirroring on or off for one session"))
