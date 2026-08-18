@@ -6,6 +6,7 @@ Subcommands::
     remote-control on|off <session-id>     idempotent forms of the same thing
     remote-control status [<session-id>]   what is bound, and whether the bridge is consuming
     remote-control hook                    read ONE hook payload on stdin (fast path)
+    remote-control session-start           alias of `hook`, kept for older installs
     remote-control install                 install the Skill + merge the hooks into settings.json
     remote-control uninstall               remove only what this project installed
     remote-control doctor                  check the whole chain
@@ -273,7 +274,8 @@ def add_parser(sub) -> None:
                      help="user-facing name shown by the Skill and its notices")
     ins.add_argument("--python", default="", help="interpreter for the hook command")
     ins.add_argument("--no-permission-prompts", action="store_true",
-                     help="install without remote Allow/Deny buttons (notification only)")
+                     help="install with remote decisions OFF — no permission Allow/Deny buttons "
+                          "and no answering Claude's questions; both are reported only")
     ins.add_argument("--permission-timeout", type=float, default=core.PERMISSION_TIMEOUT,
                      help="seconds a permission request waits for a remote answer "
                           f"(default: {core.PERMISSION_TIMEOUT:.0f})")

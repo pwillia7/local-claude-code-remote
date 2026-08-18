@@ -73,17 +73,17 @@ session through Agent2Telegram's existing attach mode, exactly as before.
 * **No terminal scraping and no transcript parsing** on the local-mirror path. Assistant text
   comes from the documented `MessageDisplay` hook.
 * **Hooks do no network I/O.** They write one small file and exit; the long-running bridge does
-  every Telegram call. The one hook that waits — the permission prompt — waits on a local file,
-  and only while Claude Code is already stopped asking a human anyway.
+  every Telegram call. Two of them wait — a permission request and a question — and they wait on
+  a local file, only while Claude Code is already stopped asking a human anyway.
 * **Telegram-originated turns are never duplicated.** `UserPromptSubmit` classifies each turn's
   origin, and the mirror only ever handles terminal-originated ones.
-* **Permissions are decided by a human, remotely or locally.** A permission request goes to the
-  chat with Allow/Deny buttons; if nobody answers in time the normal terminal prompt appears.
-  Nothing is ever auto-approved.
+* **Permissions and questions are decided by a human, remotely or locally.** Both go to the chat
+  with buttons; if nobody answers in time, the normal terminal prompt or picker appears. Nothing
+  is ever auto-approved or auto-answered.
 * **The bridge starts itself.** Enabling mirroring launches the bridge if it isn't running —
   and refuses to start a second one, because Telegram allows exactly one poller per bot.
-* **A blocked session never looks busy.** When Claude Code stops to ask a question, typing stops
-  and the chat says what it is waiting for.
+* **A blocked session never looks busy.** When Claude Code stops to ask, typing stops and the
+  chat shows the question — with its options, ready to answer.
 * **Several sessions can share one bridge.** Each keeps its own streaming state, and messages
   gain a `[project]` label as soon as more than one is connected.
 * **Qwen through CCR is the reference configuration** — see
@@ -198,7 +198,14 @@ Full event-by-event walkthrough: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 ## Requirements
 
 * Claude Code (`claude`) — the hook events used here need a recent version (`MessageDisplay`,
-  `SubagentStart`, `TaskCreated`/`TaskCompleted`, `StopFailure`).
+  `SubagentStart`, `TaskCreated`/`TaskCompleted`, `StopFailure`, `PreCompact`/`PostCompact`,
+  `Elicitation`). Everything degrades to "that part isn't mirrored" if an event is missing, never
+  to a broken session.
+* One caveat worth stating plainly: Claude Code's hook reference does not mention
+  `AskUserQuestion`, so *answering questions remotely relies on `PreToolUse` firing for it* —
+  which follows from it being a tool, but is an inference rather than a documented guarantee. If
+  it doesn't fire on your version, you simply get today's behaviour: the picker appears at the
+  terminal and nothing is lost.
 * Python 3.10+ — the runtime has **zero** third-party dependencies.
 * `tmux` — hosts the session the bridge attaches to.
 * A Telegram bot token and your numeric Telegram user id.
@@ -288,6 +295,7 @@ python3 -m agent2telegram remote-control uninstall       # remove hooks, Skill a
 | [`docs/SECURITY.md`](docs/SECURITY.md) | threat model, what is stored, what is never stored |
 | [`docs/UPSTREAM_README.md`](docs/UPSTREAM_README.md) | upstream Agent2Telegram's README, verbatim |
 | [`skills/`](skills) | the `local-remote-setup` agent playbook — let Claude Code install this for you |
+| [`CHANGELOG.md`](CHANGELOG.md) | what this fork added, in order |
 | [`examples/`](examples) | sanitized launcher, shell integration and bridge config |
 
 ## Compatibility
@@ -317,11 +325,23 @@ Upstream is kept as the `upstream` git remote. Nothing here is pushed to it.
 
 ## Future work
 
-* Telegram inline **Allow/Deny** buttons for `PermissionRequest`.
+Shipped since the first cut: remote permission approval, answering Claude's questions, Markdown
+rendering, bridge auto-start, blocking-dialog reporting, `/stop`, agent slash commands,
+multi-session support, compaction notices and the connect-time recap. See [`CHANGELOG.md`](CHANGELOG.md).
+
+Still open:
+
+* Answering **MCP elicitations** from the chat — unlike `AskUserQuestion` they have no decision
+  channel, only a refusal (exit 2).
+* An "always allow this tool" button, once there is a documented way to persist a permission rule.
+* Remote permission prompts for **Telegram-originated** turns too; today they are mirrored for the
+  local seat only, which is what guarantees no turn is ever duplicated.
+* **Presence awareness** — Claude Code skips its own pushes while you are at the keyboard, via
+  `CLAUDE_CLIENT_PRESENCE_FILE`. Adopting it is easy; deciding what to suppress is not, because
+  our messages are the mirror itself, so skipping them leaves holes in the chat history.
 * Multiple CCR profiles/models against one bridge, and a generic Skill alias.
 * Transports other than Telegram.
 * Upstreaming the generic hook-event adapter to Agent2Telegram.
-* Richer reconnection/session status in the chat.
 
 ## Licence
 

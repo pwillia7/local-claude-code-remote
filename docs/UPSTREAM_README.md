@@ -1,3 +1,7 @@
+<!-- Upstream Agent2Telegram's README, kept verbatim for attribution. Only the two
+     relative links below were repointed, because this file moved from the repository
+     root into docs/. This fork's own README is at ../README.md. -->
+
 # Agent2Telegram
 
 [![CI](https://github.com/petrludwig-collab/Agent2Telegram/actions/workflows/ci.yml/badge.svg)](https://github.com/petrludwig-collab/Agent2Telegram/actions/workflows/ci.yml)
@@ -96,7 +100,7 @@ its own `--config` — no re-setup, no re-entering tokens.
 
 If you already have **Codex** (or Claude Code) installed and logged in, you can let it do
 the whole install and fix any environment hiccups itself. The repo ships an
-[`AGENTS.md`](AGENTS.md) playbook the agent follows step by step.
+[`AGENTS.md`](../AGENTS.md) playbook the agent follows step by step.
 
 Three steps:
 1. **Install the agent CLI and log in** (the one genuinely manual part on a clean machine):
@@ -294,4 +298,4 @@ python3 -m unittest discover -s tests -v   # zero-dependency test suite
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](../LICENSE).

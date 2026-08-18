@@ -1,14 +1,27 @@
 #!/usr/bin/env bash
-# Agent2Telegram one-command installer.
-# Usage:  curl -fsSL <raw-url>/install.sh | bash      (or run it from a clone)
-# It checks Python, installs the package for the current user, and launches setup.
+# Local Claude Code Remote Control — installer (forked from Agent2Telegram's).
+#
+# Usage:  ./install.sh                       run it from inside a clone of THIS repo
+#         A2T_REPO=<url> ./install.sh        install from a specific clone URL
+#
+# It checks Python, installs the package for the current user, and launches the Agent2Telegram
+# setup wizard. That gets you the bridge; Remote Control itself needs one more step, which this
+# script prints at the end:
+#
+#     python3 -m agent2telegram remote-control install --claude-config-dir ...
+#
+# NOTE: this fork does not have a public clone URL baked in on purpose. Upstream's installer
+# hard-coded petrludwig-collab/Agent2Telegram, which would quietly install a package WITHOUT
+# Remote Control — the one failure this script must not have. Run it from a clone, or set
+# A2T_REPO yourself.
 set -euo pipefail
 
 # Recover the working directory if it was deleted (e.g. you just uninstalled while sitting in
 # the source clone) — otherwise git/curl fail with "cannot access parent directories: getcwd".
 cd "$PWD" 2>/dev/null || cd "$HOME" 2>/dev/null || cd /
 
-REPO="https://github.com/petrludwig-collab/Agent2Telegram.git"
+# Deliberately empty: see the note above. Set A2T_REPO to install from a clone URL.
+REPO="${A2T_REPO:-}"
 NEED_PY_MAJOR=3
 NEED_PY_MINOR=10
 
@@ -43,10 +56,13 @@ if [ -f "pyproject.toml" ] && grep -q "agent2telegram" pyproject.toml 2>/dev/nul
   SRC="$(pwd)"
   say "Installing from current directory"
 else
+  [ -n "$REPO" ] || err "Run this from inside a clone of this repository, or set A2T_REPO to its
+       clone URL. (Refusing to guess: installing the wrong repository would give you a bridge
+       with no Remote Control, and you would not find out until nothing mirrored.)"
   command -v git >/dev/null || err "git not found (needed to fetch the project)."
-  SRC="${HOME}/.agent2telegram-src"
+  SRC="${HOME}/.local-claude-code-remote-src"
   if [ -d "$SRC/.git" ]; then say "Updating $SRC"; git -C "$SRC" pull --ff-only
-  else say "Cloning into $SRC"; git clone --depth 1 "$REPO" "$SRC"; fi
+  else say "Cloning $REPO into $SRC"; git clone --depth 1 "$REPO" "$SRC"; fi
 fi
 
 # 3) Make `agent2telegram` a real command. pip is OPTIONAL (the core is pure standard library):
@@ -79,14 +95,28 @@ case ":$PATH:" in
     say "For THIS terminal, run:  export PATH=\"$BIND:\$PATH\"   (new terminals get it automatically)" ;;
 esac
 
-# 4) Launch the setup wizard.
+# 4) Launch the setup wizard, then point at the Remote Control step.
 # When invoked as `curl … | bash`, this script's stdin is the pipe, not your keyboard,
 # so the interactive wizard must read from the controlling terminal (/dev/tty).
-say "Run it later with:  $HOW run"
+say "Run the bridge later with:  $HOW run"
+cat <<'NEXT'
+
+==> After the wizard, install Remote Control itself:
+
+      python3 -m agent2telegram remote-control install           --claude-config-dir "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"           --tmux-session <your-tmux-session>           --dry-run
+
+    Drop --dry-run once the reported changes look right, then check it with:
+
+      python3 -m agent2telegram remote-control doctor
+
+    Or let Claude Code do all of it: copy skills/local-remote-setup into your Claude
+    config dir's skills/ and ask it to set this up. See skills/README.md.
+
+NEXT
 if [ -e /dev/tty ]; then
-  say "Starting setup…"
+  say "Starting the bridge setup wizard…"
   exec "${RUN[@]}" setup </dev/tty
 else
-  say "Installed. Finish setup with:"
+  say "Installed. Finish the bridge setup with:"
   echo "    $HOW setup"
 fi

@@ -7,9 +7,18 @@ documented Claude Code hooks:
 
     Claude Code hooks → local event spool → Agent2Telegram bridge → Telegram
 
-Nothing here scrapes a terminal, parses a transcript as a primary source, opens a port, or
-approves a permission on your behalf. See :mod:`.core` for the hook side (fast, local-only),
-:mod:`.mirror` for the Telegram side and :mod:`.install` for the installer.
+Permissions and questions can be decided from the chat, but only by a person pressing a button
+or replying — never on a timer, a heuristic or the model's say-so. Nothing here scrapes a
+terminal, opens a port, or reads a transcript on the live path (the one exception, the
+connect-time recap, is bounded and explicit).
+
+Modules:
+
+  :mod:`.core`       the hook side — fast, standard-library only, local-only, fails open
+  :mod:`.mirror`     the Telegram side, driven from the bridge's outbound loop
+  :mod:`.cli`        the ``remote-control`` command tree
+  :mod:`.install`    installer, uninstaller and doctor
+  :mod:`.supervise`  starting the bridge without ever starting a second poller
 """
 from __future__ import annotations
 

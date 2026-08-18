@@ -342,11 +342,12 @@ class RemoteControlMirror:
 
     # ---- blocking dialogs --------------------------------------------------
     def _on_question(self, ev: dict, sid: str) -> None:
-        """``AskUserQuestion``: the session has STOPPED to ask, and emits no turn end.
+        """Report a question the chat cannot answer — remote decisions are off, or no bridge was
+        listening when it was asked.
 
-        Without this the chat shows "typing…" indefinitely while Claude Code sits on a picker at
-        the keyboard. There is no documented hook output that supplies an answer, so this
-        reports the question and points at the terminal instead of pretending otherwise.
+        The answerable version is :meth:`_on_question_request`. Either way the session has
+        STOPPED to ask and emits no turn end, so without this the chat would show "typing…"
+        indefinitely beside a session that is really parked on a picker.
         """
         lines = ["❓ <b>Waiting for your answer</b>"]
         for q in ev.get("questions") or []:
@@ -359,7 +360,8 @@ class RemoteControlMirror:
                 lines.append(html.escape(q["question"]))
             for i, option in enumerate(q.get("options") or [], 1):
                 lines.append(f"  {i}. {html.escape(option)}")
-        lines += ["", "<i>Answer it at the terminal — this one can't be answered from here.</i>"]
+        lines += ["", "<i>Remote answering is off for this session — answer it at the "
+                      "terminal.</i>"]
         self._open_dialog(sid, ev.get("tool_use_id", ""), "\n".join(lines))
 
     def _on_question_request(self, ev: dict, sid: str) -> None:

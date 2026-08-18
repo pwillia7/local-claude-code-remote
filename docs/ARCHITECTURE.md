@@ -219,6 +219,12 @@ hook returns nothing and Claude Code shows its own picker — the same fallback 
 MCP elicitations are reported but not answerable: `Elicitation` can only block via exit 2, which
 is a refusal, not an answer.
 
+One caveat worth stating rather than burying: Claude Code's hook reference does not mention
+`AskUserQuestion` anywhere, so **this rests on `PreToolUse` firing for it** — which follows from
+it being a tool, but is an inference, not a documented guarantee. The failure mode if it doesn't
+fire is benign and silent in the right direction: no hook runs, no card is posted, and Claude Code
+shows its picker at the terminal exactly as it would without this project installed.
+
 ### 6. Interrupting from Telegram
 
 `/stop` sends the agent's own Escape to the tmux seat — a single press, because a double Escape
