@@ -20,18 +20,23 @@ tail of an answer.
 """
 from __future__ import annotations
 
+import html
 import logging
+import threading
 import time
 
 from . import core
-from ..telegram import MAX_MESSAGE_LEN
+from ..telegram import MAX_MESSAGE_LEN, markdown_to_html
 
 log = logging.getLogger("agent2telegram.remote_control")
 
 #: Minimum spacing between edits of the same streaming Telegram message.
 EDIT_INTERVAL = 0.6
-#: Leave room for Telegram's own accounting (it counts UTF-16 code units, we count characters).
-CHUNK_LIMIT = MAX_MESSAGE_LEN - 200
+#: Chunk on the RAW text, well under the wire limit: rendering Markdown to HTML only ever makes
+#: a message longer (tags, entity escapes), and the rendered form still has to fit.
+CHUNK_LIMIT = 3000
+#: Telegram's real ceiling. If a rendered chunk somehow exceeds it we send the raw text instead.
+WIRE_LIMIT = MAX_MESSAGE_LEN
 #: Most events consumed per tick — keeps one bridge cycle bounded even after a long outage.
 DRAIN_LIMIT = 400
 #: Above this the spool is being produced faster than it is consumed (or was orphaned); the
@@ -40,6 +45,30 @@ DROP_ABOVE = core.MAX_PENDING * 2
 #: Safety net: a turn that never sends Stop or StopFailure (Claude Code was killed, the machine
 #: slept) must not leave "typing…" and a status bubble lit forever.
 IDLE_DONE = 180.0
+#: Inline keyboard removed by replacing it with an empty one.
+NO_KEYBOARD = {"inline_keyboard": []}
+
+
+def _render(text: str) -> str | None:
+    """The agent's Markdown as Telegram HTML, or None when it will not fit the wire limit.
+
+    ``markdown_to_html`` only emits a tag for a *closed* span, so a half-streamed ``**bold`` or
+    an unterminated code fence stays literal text rather than becoming unbalanced HTML.
+    """
+    try:
+        rendered = markdown_to_html(text)
+    except Exception:
+        return None
+    return rendered if len(rendered) <= WIRE_LIMIT else None
+
+
+def _replace_header(text: str, header: str) -> str:
+    """Swap the first line of an approval card for its outcome, keeping the details below.
+
+    Telegram hands the message back as plain text (entities stripped), so the body is escaped
+    rather than re-rendered."""
+    body = "\n".join((text or "").splitlines()[1:]).strip("\n")
+    return header + (f"\n\n{html.escape(body)}" if body else "")
 
 
 def _split_head(text: str, limit: int) -> tuple[str, str]:
@@ -73,11 +102,13 @@ class RemoteControlMirror:
     """
 
     def __init__(self, bridge: str, *, send_plain_id, edit_plain, send_text,
-                 status_push, status_clear, set_active, label: str = "") -> None:
+                 status_push, status_clear, set_active, answer_callback_query=None,
+                 label: str = "") -> None:
         self.bridge = core.slug(bridge)
         self.label = label
         self._send_plain_id = send_plain_id
         self._edit_plain = edit_plain
+        self._answer_callback_query = answer_callback_query
         self._send_text = send_text
         self._status_push = status_push
         self._status_clear = status_clear
@@ -87,6 +118,10 @@ class RemoteControlMirror:
         self._delivered = False        # did this turn already put assistant text in the chat?
         self._active = False
         self._last_event = 0.0
+        # Approval cards awaiting a button press. Touched by the bridge's outbound thread (when
+        # a card is posted) AND by its inbound thread (when the press arrives), so it is locked.
+        self._pending_perms: dict[str, dict] = {}
+        self._perm_lock = threading.Lock()
 
     # ---- lifecycle ---------------------------------------------------------
     def tick(self) -> int:
@@ -119,6 +154,7 @@ class RemoteControlMirror:
         return handled
 
     def _prune(self) -> None:
+        core.sweep_decisions(self.bridge)
         pending = core.pending_count(self.bridge)
         if pending <= DROP_ABOVE:
             return
@@ -157,6 +193,11 @@ class RemoteControlMirror:
             self._status_push("✅ Task completed: " + core.short(ev.get("task_name", ""), 60))
         elif kind == "permission":
             self._on_permission(ev)
+        elif kind == "permission_request":
+            self._on_permission_request(ev)
+        elif kind == "permission_expired":
+            self._resolve_permission(ev.get("request_id", ""),
+                                     "⌛ <b>Expired</b> — answer it at the terminal.")
         elif kind == "notification":
             self._on_notification(ev)
         elif kind == "turn_end":
@@ -196,6 +237,94 @@ class RemoteControlMirror:
             "Approve or deny it in the terminal — remote approval isn't supported yet.",
             parse_mode=None)
 
+    def _on_permission_request(self, ev: dict) -> None:
+        """Post an approval card with Allow/Deny buttons; the hook is blocked waiting on it."""
+        request_id = ev.get("request_id", "")
+        if not request_id:
+            return
+        self._activate(True)
+        self._status_clear()                       # the card must be the last thing in the chat
+        keyboard = {"inline_keyboard": [[
+            {"text": "✅ Allow", "callback_data": f"p:{request_id}:a"},
+            {"text": "⛔ Deny", "callback_data": f"p:{request_id}:d"},
+        ]]}
+        mid = self._send_plain_id(self._permission_card(ev), parse_mode="HTML",
+                                  reply_markup=keyboard)
+        if mid is None:
+            log.warning("remote-control: could not post the approval card; "
+                        "the terminal prompt will handle it")
+            return
+        with self._perm_lock:
+            self._pending_perms[request_id] = {"mid": mid, "ts": time.monotonic()}
+        log.info("MIRROR (permission) card %s for %s", mid, ev.get("tool_name", "?"))
+
+    @staticmethod
+    def _permission_card(ev: dict, header: str = "🔐 <b>Permission needed</b>") -> str:
+        tool = html.escape(ev.get("tool_name") or "a tool")
+        summary = html.escape(ev.get("summary") or "")
+        detail = ev.get("detail") or ""
+        lines = [header, "", f"<b>{tool}</b>"]
+        if summary:
+            lines.append(summary)
+        if detail:
+            lines.append(f"<code>{html.escape(detail)}</code>")
+        return "\n".join(lines)
+
+    def handle_callback(self, query: dict, allowed_ids) -> bool:
+        """Apply an inline-button press. Runs on the bridge's INBOUND thread.
+
+        Returns True when the press was ours (handled), so the caller stops looking at it.
+        Only allow-listed users are honoured — the same list that may drive the session at all.
+        """
+        data = (query.get("data") or "")
+        if not data.startswith("p:"):
+            return False
+        parts = data.split(":")
+        if len(parts) != 3:
+            return True
+        _, request_id, verdict = parts
+        user_id = (query.get("from") or {}).get("id")
+        if user_id not in set(allowed_ids or ()):
+            self._answer_callback(query, "Not authorized.")
+            log.warning("remote-control: rejected a permission press from an unknown user")
+            return True
+
+        with self._perm_lock:
+            pending = self._pending_perms.pop(request_id, None)
+        if pending is None:
+            self._answer_callback(query, "That request is no longer waiting.")
+            return True
+
+        decision = "allow" if verdict == "a" else "deny"
+        core.write_decision(self.bridge, request_id, decision, by=user_id)
+        self._answer_callback(query, "Allowed ✅" if decision == "allow" else "Denied ⛔")
+        message = (query.get("message") or {})
+        text = message.get("text") or ""
+        head = "✅ <b>Allowed</b>" if decision == "allow" else "⛔ <b>Denied</b>"
+        self._edit_plain(pending["mid"], _replace_header(text, head),
+                         parse_mode="HTML", reply_markup=NO_KEYBOARD)
+        log.info("remote-control: permission %s → %s", request_id[:8], decision)
+        return True
+
+    def _answer_callback(self, query: dict, text: str) -> None:
+        cb = self._answer_callback_query
+        if cb is not None:
+            cb(query.get("id", ""), text)
+
+    def _resolve_permission(self, request_id: str, header: str) -> None:
+        """Close out a card nobody pressed — expired, or answered at the keyboard instead."""
+        with self._perm_lock:
+            pending = self._pending_perms.pop(request_id, None)
+        if pending is None:
+            return
+        self._edit_plain(pending["mid"], header, parse_mode="HTML", reply_markup=NO_KEYBOARD)
+
+    def _resolve_all_permissions(self, header: str) -> None:
+        with self._perm_lock:
+            ids = list(self._pending_perms)
+        for request_id in ids:
+            self._resolve_permission(request_id, header)
+
     def _on_notification(self, ev: dict) -> None:
         texts = {
             "idle_prompt": "🔔 Waiting for your input.",
@@ -231,6 +360,9 @@ class RemoteControlMirror:
         self._end_turn()
 
     def _end_turn(self) -> None:
+        # The turn is over, so any card still showing buttons was answered at the keyboard
+        # (or abandoned). Leaving live buttons would let a later press decide nothing.
+        self._resolve_all_permissions("🖥️ <b>Answered at the terminal</b>")
         self._status_clear()
         self._activate(False)
         self._delivered = False
@@ -277,15 +409,22 @@ class RemoteControlMirror:
         if text == state.shown:
             state.last_edit = time.monotonic()
             return
+        # Render the agent's Markdown, but never at the cost of losing content: if Telegram
+        # rejects the rich version (or it would not fit), the same text goes out as plain.
+        rendered = _render(text)
         if state.mid is None:
-            mid = self._send_plain_id(text)
+            mid = self._send_plain_id(rendered, parse_mode="HTML") if rendered else None
+            if mid is None:
+                mid = self._send_plain_id(text)
             if mid is None:
                 return                             # send failed; retry on the next flush
             state.mid = mid
             # Metadata only — message CONTENT is never logged (see docs/SECURITY.md).
             log.info("MIRROR (stream) telegram msg %s, %d chars", mid, len(text))
         else:
-            self._edit_plain(state.mid, text)
+            ok = self._edit_plain(state.mid, rendered, parse_mode="HTML") if rendered else False
+            if not ok and not self._edit_plain(state.mid, text):
+                return                             # leave `shown` alone so the next flush retries
         state.shown = text
         state.last_edit = time.monotonic()
         self._delivered = True

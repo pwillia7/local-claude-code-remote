@@ -102,6 +102,10 @@ Run exactly one bridge for the token:
 python3 -m agent2telegram run            # or the unit from: python3 -m agent2telegram service
 ```
 
+You can skip this: `/qwen-remote` starts the bridge itself when nothing is consuming, in a tmux
+session called `a2t-<tmux-session>`. It will never start a second one — if a bridge is already
+running but not draining the spool (an older build, or a wedged one), it says so instead.
+
 ## 5. Install Remote Control
 
 ```bash
@@ -115,6 +119,14 @@ python3 -m agent2telegram remote-control install \
 This merges the hook entries into that profile's `settings.json` (backing it up first, leaving
 every other hook alone) and writes the Skill to
 `.../claude/skills/qwen-remote/`. Use `--dry-run` first if you want to see the diff.
+
+Two options worth knowing:
+
+* `--permission-timeout <seconds>` (default 90) — how long a permission request waits for an
+  Allow/Deny press before the terminal prompt takes over. The `PermissionRequest` hook's own
+  `timeout` in `settings.json` is set 30 s above it, so our graceful fallback always wins.
+* `--no-permission-prompts` — surface permission requests as a notice only, and decide at the
+  keyboard as before.
 
 Verify:
 
@@ -141,6 +153,8 @@ terminal appears there until you run `/qwen-remote` again, exit, resume or fork.
 
 * A local model produces long, bursty text. The mirror throttles Telegram edits to one per
   ~0.6 s per message, so a fast local model cannot trip flood control.
+* Local models call tools enthusiastically, so remote approval earns its keep here: without it,
+  a turn started from the phone stalls on the first prompt until you get back to the keyboard.
 * Local models are also more likely to hit gateway errors. `StopFailure` ends the mirrored turn
   and reports `error_type` — otherwise the phone would sit on "typing…" forever.
 * CCR restarts do not affect the mirror: the spool is on disk and the bridge drains it when it

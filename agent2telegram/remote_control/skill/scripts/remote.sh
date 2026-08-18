@@ -10,4 +10,4 @@ if [[ -z "$SID" ]]; then
 fi
 
 exec {{PYTHON}} -m agent2telegram remote-control toggle "$SID" \
-    --label {{LABEL_SHELL}}{{CONFIG_ARG}}
+    --label {{LABEL_SHELL}}{{CONFIG_ARG}}{{PERMISSION_ARGS}}

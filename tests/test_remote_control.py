@@ -6,15 +6,24 @@ Telegram operations as callables, so both are directly observable.
 """
 from __future__ import annotations
 
+import io
 import json
 import os
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
 from agent2telegram.remote_control import core
 from agent2telegram.remote_control import mirror as mirror_mod
 from agent2telegram.remote_control.mirror import RemoteControlMirror
+from agent2telegram.telegram import markdown_to_html
+
+
+def rendered(*texts):
+    """What the mirror is expected to put on the wire: the agent's Markdown as Telegram HTML."""
+    return [markdown_to_html(t) for t in texts]
 
 BRIDGE = "test-seat"
 SID = "11111111-2222-3333-4444-555555555555"
@@ -42,8 +51,12 @@ class _StateCase(unittest.TestCase):
                           origins=origins, label="Test")
 
     def hook(self, event: str, **fields) -> None:
-        core.handle({"hook_event_name": event, "session_id": fields.pop("session_id", SID),
-                     **fields})
+        self.hook_out(event, **fields)
+
+    def hook_out(self, event: str, **fields):
+        """Run one hook payload and return whatever JSON output it produced (usually None)."""
+        return core.handle({"hook_event_name": event,
+                            "session_id": fields.pop("session_id", SID), **fields})
 
     def events(self):
         return [e for _, e in core.read_events(BRIDGE) if e]
@@ -218,10 +231,21 @@ class DisabledTests(_StateCase):
             self.hook(event, **fields)
         self.assertEqual(core.pending_count(BRIDGE), 0)
 
-    def test_hook_never_raises_on_garbage(self):
-        self.assertEqual(core.handle({}), 0)
-        self.assertEqual(core.handle({"hook_event_name": "MessageDisplay"}), 0)
-        self.assertEqual(core.handle({"hook_event_name": "Nonsense", "session_id": SID}), 0)
+    def test_hook_never_raises_and_says_nothing(self):
+        # No output at all means Claude Code behaves exactly as if the hook weren't there.
+        self.assertIsNone(core.handle({}))
+        self.assertIsNone(core.handle({"hook_event_name": "MessageDisplay"}))
+        self.assertIsNone(core.handle({"hook_event_name": "Nonsense", "session_id": SID}))
+
+    def test_hook_main_writes_nothing_for_ordinary_events(self):
+        out = io.StringIO()
+        self.assertEqual(core.hook_main(io.StringIO('{"hook_event_name":"Stop"}'), out), 0)
+        self.assertEqual(out.getvalue(), "")
+
+    def test_hook_main_survives_malformed_stdin(self):
+        out = io.StringIO()
+        self.assertEqual(core.hook_main(io.StringIO("not json"), out), 0)
+        self.assertEqual(out.getvalue(), "")
 
 
 # --------------------------------------------------------------------------- summaries
@@ -269,21 +293,39 @@ class _FakeChat:
         self.sent_text: list[str] = []
         self.status: list[str] = []
         self.active: list[bool] = []
+        self.keyboards: dict[int, dict] = {}
+        self.parse_modes: list = []
+        self.answered: list = []
         self.cleared = 0
         self._next = 100
         self.fail_send = False
+        self.reject_html = False        # simulate Telegram refusing a parse_mode=HTML payload
 
     # streaming primitives
-    def send_plain_id(self, text: str):
+    def send_plain_id(self, text: str, parse_mode=None, reply_markup=None):
         if self.fail_send:
+            return None
+        if self.reject_html and parse_mode == "HTML":
             return None
         self._next += 1
         self.messages[self._next] = text
         self.order.append(self._next)
+        self.parse_modes.append(parse_mode)
+        if reply_markup is not None:
+            self.keyboards[self._next] = reply_markup
         return self._next
 
-    def edit_plain(self, mid: int, text: str) -> None:
+    def edit_plain(self, mid: int, text: str, parse_mode=None, reply_markup=None) -> bool:
+        if self.reject_html and parse_mode == "HTML":
+            return False
         self.messages[mid] = text
+        self.parse_modes.append(parse_mode)
+        if reply_markup is not None:
+            self.keyboards[mid] = reply_markup
+        return True
+
+    def answer_callback_query(self, callback_id: str, text: str = "") -> None:
+        self.answered.append((callback_id, text))
 
     # durable send / bubble / typing
     def send_text(self, text: str, parse_mode: str = "auto") -> None:
@@ -309,7 +351,8 @@ class MirrorTests(_StateCase):
         self.mirror = RemoteControlMirror(
             BRIDGE, send_plain_id=self.chat.send_plain_id, edit_plain=self.chat.edit_plain,
             send_text=self.chat.send_text, status_push=self.chat.status_push,
-            status_clear=self.chat.status_clear, set_active=self.chat.set_active)
+            status_clear=self.chat.status_clear, set_active=self.chat.set_active,
+            answer_callback_query=self.chat.answer_callback_query)
         self._interval = mirror_mod.EDIT_INTERVAL
         mirror_mod.EDIT_INTERVAL = 0.0            # deterministic: never defer an edit
         self.addCleanup(self._restore_interval)
@@ -326,7 +369,7 @@ class MirrorTests(_StateCase):
     def test_first_delta_creates_a_message(self):
         self.display("m1", "I'll inspect the importer.")
         self.mirror.tick()
-        self.assertEqual(self.chat.stream(), ["I'll inspect the importer."])
+        self.assertEqual(self.chat.stream(), rendered("I'll inspect the importer."))
 
     def test_later_deltas_edit_the_same_message(self):
         self.display("m1", "Hello")
@@ -439,13 +482,15 @@ class MirrorTests(_StateCase):
         ])
         self.assertEqual(len(self.chat.order), 0)
 
-    def test_permission_request_notifies_without_approving(self):
-        self.hook("PermissionRequest", tool_name="Bash",
-                  tool_input={"description": "delete things"})
+    def test_permission_notify_only_mode_never_offers_buttons(self):
+        core.bind_session(SID, bridge=BRIDGE, permissions=False)
+        self.assertIsNone(self.hook_out("PermissionRequest", tool_name="Bash",
+                                        tool_input={"description": "delete things"}))
         self.mirror.tick()
         self.assertEqual(len(self.chat.sent_text), 1)
         self.assertIn("Waiting for permission", self.chat.sent_text[0])
         self.assertIn("terminal", self.chat.sent_text[0])
+        self.assertEqual(self.chat.keyboards, {})
 
     def test_notifications_are_filtered(self):
         self.hook("Notification", notification_type="permission_prompt")
@@ -508,6 +553,269 @@ class MirrorTests(_StateCase):
         self.assertEqual(self.mirror._live, {})
 
 
+# --------------------------------------------------------------------------- permissions
+
+class PermissionApprovalTests(_StateCase):
+    """Allow/Deny travelling out to Telegram and the decision travelling back."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.chat = _FakeChat()
+        self.mirror = RemoteControlMirror(
+            BRIDGE, send_plain_id=self.chat.send_plain_id, edit_plain=self.chat.edit_plain,
+            send_text=self.chat.send_text, status_push=self.chat.status_push,
+            status_clear=self.chat.status_clear, set_active=self.chat.set_active,
+            answer_callback_query=self.chat.answer_callback_query)
+        self.enable()
+        core.touch_heartbeat(BRIDGE)          # a bridge is listening
+
+    def _request(self, **kw):
+        """Run the (blocking) PermissionRequest hook on a thread; return a handle to its result."""
+        box = {}
+
+        def run():
+            box["out"] = core.handle({
+                "hook_event_name": "PermissionRequest", "session_id": SID,
+                "tool_name": kw.get("tool_name", "Bash"),
+                "tool_input": kw.get("tool_input", {"command": "rm -rf ./build"}),
+                "tool_use_id": "tu1"})
+
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        return t, box
+
+    def _await_card(self, timeout=5.0):
+        """Drain the spool until the approval card has been posted."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            self.mirror.tick()
+            if self.chat.keyboards:
+                return next(iter(self.chat.keyboards))
+            time.sleep(0.02)
+        self.fail("no approval card was posted")
+
+    @staticmethod
+    def _callback_data(keyboard, verdict):
+        for row in keyboard["inline_keyboard"]:
+            for button in row:
+                if button["callback_data"].endswith(":" + verdict):
+                    return button["callback_data"]
+        raise AssertionError("no such button")
+
+    def _press(self, mid, verdict, user_id=1):
+        data = self._callback_data(self.chat.keyboards[mid], verdict)
+        return self.mirror.handle_callback(
+            {"id": "cb1", "data": data, "from": {"id": user_id},
+             "message": {"message_id": mid, "text": self.chat.messages[mid]}},
+            [1])
+
+    # ---- the happy paths
+    def test_allow_button_returns_an_allow_decision_to_claude(self):
+        thread, box = self._request()
+        mid = self._await_card()
+        self._press(mid, "a")
+        thread.join(5)
+        self.assertEqual(box["out"], {"hookSpecificOutput": {
+            "hookEventName": "PermissionRequest", "decision": "allow"}})
+
+    def test_deny_button_returns_a_deny_decision_with_a_reason(self):
+        thread, box = self._request()
+        mid = self._await_card()
+        self._press(mid, "d")
+        thread.join(5)
+        out = box["out"]["hookSpecificOutput"]
+        self.assertEqual(out["decision"], "deny")
+        self.assertEqual(out["hookEventName"], "PermissionRequest")
+        self.assertTrue(out.get("reason"))
+
+    def test_card_shows_the_tool_and_safe_detail(self):
+        thread, box = self._request(tool_name="Bash",
+                                    tool_input={"command": "rm -rf ./build"})
+        mid = self._await_card()
+        card = self.chat.messages[mid]
+        self.assertIn("Permission needed", card)
+        self.assertIn("Bash", card)
+        self.assertIn("rm -rf ./build", card)
+        self._press(mid, "d")
+        thread.join(5)
+
+    def test_answering_clears_the_buttons_and_states_the_outcome(self):
+        thread, box = self._request()
+        mid = self._await_card()
+        self._press(mid, "a")
+        thread.join(5)
+        self.assertEqual(self.chat.keyboards[mid], mirror_mod.NO_KEYBOARD)
+        self.assertIn("Allowed", self.chat.messages[mid])
+        self.assertTrue(self.chat.answered)                 # the button spinner was stopped
+
+    # ---- the safe fallbacks
+    def test_no_answer_falls_back_to_the_terminal_prompt(self):
+        core.bind_session(SID, bridge=BRIDGE, permission_timeout=0.3)
+        out = core.handle({"hook_event_name": "PermissionRequest", "session_id": SID,
+                           "tool_name": "Bash", "tool_input": {"command": "ls"}})
+        self.assertIsNone(out)                              # no decision → normal flow
+        self.assertIn("permission_expired", self.kinds())
+
+    def test_expiry_retracts_the_buttons(self):
+        core.bind_session(SID, bridge=BRIDGE, permission_timeout=0.3)
+        core.handle({"hook_event_name": "PermissionRequest", "session_id": SID,
+                     "tool_name": "Bash", "tool_input": {"command": "ls"}})
+        self.mirror.tick()
+        mid = next(iter(self.chat.keyboards))
+        self.assertEqual(self.chat.keyboards[mid], mirror_mod.NO_KEYBOARD)
+        self.assertIn("Expired", self.chat.messages[mid])
+
+    def test_no_bridge_means_no_waiting_at_all(self):
+        os.unlink(core.heartbeat_path(BRIDGE))              # bridge is down
+        started = time.monotonic()
+        out = core.handle({"hook_event_name": "PermissionRequest", "session_id": SID,
+                           "tool_name": "Bash", "tool_input": {"command": "ls"}})
+        self.assertIsNone(out)
+        self.assertLess(time.monotonic() - started, 1.0)    # must NOT block the session
+        self.assertEqual(self.kinds(), [])
+
+    def test_telegram_originated_turns_never_ask_remotely(self):
+        self.hook("UserPromptSubmit", user_input="[TG] do it")
+        out = core.handle({"hook_event_name": "PermissionRequest", "session_id": SID,
+                           "tool_name": "Bash", "tool_input": {"command": "ls"}})
+        self.assertIsNone(out)
+        self.assertEqual(self.kinds(), [])
+
+    # ---- authorization
+    def test_a_stranger_cannot_decide(self):
+        thread, box = self._request()
+        mid = self._await_card()
+        self._press(mid, "a", user_id=999)                  # not in the allow-list
+        self.assertIsNone(core._read_json(core.decision_path(BRIDGE, "x")))
+        self.assertEqual(self.chat.keyboards[mid]["inline_keyboard"], [[
+            {"text": "✅ Allow", "callback_data": self._callback_data(
+                self.chat.keyboards[mid], "a")},
+            {"text": "⛔ Deny", "callback_data": self._callback_data(
+                self.chat.keyboards[mid], "d")}]])          # buttons still live
+        self._press(mid, "d")                               # the owner still can
+        thread.join(5)
+        self.assertEqual(box["out"]["hookSpecificOutput"]["decision"], "deny")
+
+    def test_a_second_press_is_ignored(self):
+        thread, box = self._request()
+        mid = self._await_card()
+        stale = self._callback_data(self.chat.keyboards[mid], "d")   # captured while live
+        self._press(mid, "a")
+        thread.join(5)
+        self.chat.answered.clear()
+        # Telegram removes the buttons, but a client with the message still cached could
+        # replay the press. It must decide nothing.
+        self.mirror.handle_callback(
+            {"id": "cb2", "data": stale, "from": {"id": 1},
+             "message": {"message_id": mid, "text": self.chat.messages[mid]}}, [1])
+        self.assertEqual(self.chat.answered[-1][1], "That request is no longer waiting.")
+        self.assertEqual(box["out"]["hookSpecificOutput"]["decision"], "allow")
+
+    def test_unrelated_callbacks_are_left_alone(self):
+        self.assertFalse(self.mirror.handle_callback({"id": "x", "data": "other:thing"}, [1]))
+
+    # ---- housekeeping
+    def test_turn_end_retracts_a_card_answered_at_the_keyboard(self):
+        core.bind_session(SID, bridge=BRIDGE, permission_timeout=0.3)
+        core.handle({"hook_event_name": "PermissionRequest", "session_id": SID,
+                     "tool_name": "Bash", "tool_input": {"command": "ls"}})
+        self.mirror.tick()
+        mid = next(iter(self.chat.keyboards))
+        self.mirror._pending_perms[  # re-open it as if it were still awaiting an answer
+            core.slug("x")] = {"mid": mid, "ts": 0.0}
+        self.hook("Stop", last_assistant_message="done")
+        self.mirror.tick()
+        self.assertEqual(self.mirror._pending_perms, {})
+        self.assertEqual(self.chat.keyboards[mid], mirror_mod.NO_KEYBOARD)
+
+    def test_uncollected_decisions_are_swept(self):
+        core.write_decision(BRIDGE, "abc", "allow", by=1)
+        path = core.decision_path(BRIDGE, "abc")
+        self.assertTrue(os.path.exists(path))
+        os.utime(path, (0, 0))                              # pretend it is ancient
+        core.sweep_decisions(BRIDGE)
+        self.assertFalse(os.path.exists(path))
+
+    def test_permission_detail_never_dumps_raw_mcp_arguments(self):
+        detail = core.permission_detail("mcp__vault__read", {"path": "/x", "token": "s3cret"})
+        self.assertIn("path", detail)
+        self.assertNotIn("s3cret", detail)
+
+    def test_permission_detail_redacts_secrets(self):
+        detail = core.permission_detail("Bash", {"command": "export API_TOKEN=hunter2hunter2"})
+        self.assertNotIn("hunter2hunter2", detail)
+
+
+# --------------------------------------------------------------------------- markdown
+
+class MarkdownTests(_StateCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.chat = _FakeChat()
+        self.mirror = RemoteControlMirror(
+            BRIDGE, send_plain_id=self.chat.send_plain_id, edit_plain=self.chat.edit_plain,
+            send_text=self.chat.send_text, status_push=self.chat.status_push,
+            status_clear=self.chat.status_clear, set_active=self.chat.set_active,
+            answer_callback_query=self.chat.answer_callback_query)
+        self._interval = mirror_mod.EDIT_INTERVAL
+        mirror_mod.EDIT_INTERVAL = 0.0
+        self.addCleanup(setattr, mirror_mod, "EDIT_INTERVAL", self._interval)
+        self.enable()
+
+    def display(self, mid, delta, final=False):
+        self.hook("MessageDisplay", message_id=mid, turn_id="t1", index=0,
+                  delta=delta, final=final)
+
+    def test_bold_and_code_are_rendered(self):
+        self.display("m1", "Use **bold** and `code` here.", final=True)
+        self.mirror.tick()
+        sent = self.chat.stream()[0]
+        self.assertIn("<b>bold</b>", sent)
+        self.assertIn("<code>code</code>", sent)
+        self.assertEqual(self.chat.parse_modes[0], "HTML")
+
+    def test_half_streamed_markdown_stays_literal_not_unbalanced(self):
+        self.display("m1", "starting **bold that is not closed yet")
+        self.mirror.tick()
+        sent = self.chat.stream()[0]
+        self.assertNotIn("<b>", sent)               # an unclosed span must not open a tag
+        self.assertIn("**bold that is not closed yet", sent)
+
+    def test_rejected_html_falls_back_to_plain_text(self):
+        self.chat.reject_html = True
+        self.display("m1", "**bold** text", final=True)
+        self.mirror.tick()
+        self.assertEqual(self.chat.stream(), ["**bold** text"])   # content, never lost
+
+    def test_rejected_html_on_an_edit_still_delivers_the_tail(self):
+        self.display("m1", "first part ")
+        self.mirror.tick()
+        self.chat.reject_html = True
+        self.display("m1", "and the tail.", final=True)
+        self.mirror.tick()
+        self.assertEqual(self.chat.stream(), ["first part and the tail."])
+
+    def test_a_failed_edit_is_retried_rather_than_marked_shown(self):
+        self.display("m1", "first ")
+        self.mirror.tick()
+        self.chat.reject_html = True
+        original_edit = self.chat.edit_plain
+        self.chat.edit_plain = lambda *a, **k: False        # every edit fails for now
+        self.display("m1", "second ")
+        self.mirror.tick()
+        self.chat.edit_plain = original_edit
+        self.chat.reject_html = False
+        self.mirror.tick()
+        self.assertEqual(self.chat.stream(), rendered("first second "))
+
+    def test_chunking_uses_the_raw_length_so_rendered_text_still_fits(self):
+        from agent2telegram.telegram import MAX_MESSAGE_LEN
+        self.display("m1", " ".join("a&b" for _ in range(2000)), final=True)
+        self.mirror.tick()
+        for chunk in self.chat.stream():
+            self.assertLessEqual(len(chunk), MAX_MESSAGE_LEN)   # &amp; expansion included
+
+
 # --------------------------------------------------------------------------- spool
 
 class SpoolTests(_StateCase):
@@ -519,7 +827,8 @@ class SpoolTests(_StateCase):
         return RemoteControlMirror(
             BRIDGE, send_plain_id=chat.send_plain_id, edit_plain=chat.edit_plain,
             send_text=chat.send_text, status_push=chat.status_push,
-            status_clear=chat.status_clear, set_active=chat.set_active)
+            status_clear=chat.status_clear, set_active=chat.set_active,
+            answer_callback_query=chat.answer_callback_query)
 
     def test_events_are_ordered(self):
         for i in range(30):
@@ -569,6 +878,79 @@ class SpoolTests(_StateCase):
         chat = _FakeChat()
         self._mirror(chat).tick()
         self.assertLessEqual(core.pending_count(BRIDGE), mirror_mod.DROP_ABOVE)
+
+
+# --------------------------------------------------------------------------- bridge start
+
+class SuperviseTests(_StateCase):
+    """The one rule: never start a second poller for the same bot token."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        from agent2telegram.remote_control import supervise
+        self.supervise = supervise
+
+    def test_a_fresh_heartbeat_plus_a_process_means_running(self):
+        core.touch_heartbeat(BRIDGE)
+        self._patch("running_process", lambda _cfg: "python -m agent2telegram run")
+        self.assertEqual(self.supervise.status(BRIDGE, "/x/config.json")[0], "consuming")
+
+    def test_a_fresh_heartbeat_with_no_process_is_a_dead_bridge(self):
+        # The bug this guards: a bridge killed a second ago still has a one-second-old
+        # heartbeat, and the toggle happily reported "consuming" while nothing was running.
+        core.touch_heartbeat(BRIDGE)
+        self._patch("running_process", lambda _cfg: "")
+        self.assertEqual(self.supervise.status(BRIDGE, "/x/config.json")[0], "stopped")
+
+    def test_an_uninspectable_process_list_falls_back_to_the_heartbeat(self):
+        core.touch_heartbeat(BRIDGE)
+        self._patch("running_process", lambda _cfg: None)
+        self.assertEqual(self.supervise.status(BRIDGE, "/x/config.json")[0], "consuming")
+
+    def test_an_uninspectable_process_list_never_claims_stopped_on_a_live_beat(self):
+        self._patch("running_process", lambda _cfg: None)
+        self.assertEqual(self.supervise.status(BRIDGE, "/x/config.json")[0], "stopped")
+
+    def _patch(self, name, value):
+        original = getattr(self.supervise, name)
+        setattr(self.supervise, name, value)
+        self.addCleanup(setattr, self.supervise, name, original)
+
+    def test_nothing_running_reports_stopped(self):
+        self._patch("running_process", lambda _cfg: "")
+        self.assertEqual(self.supervise.status(BRIDGE, "/x/config.json")[0], "stopped")
+
+    def test_ensure_running_is_a_no_op_when_already_consuming(self):
+        core.touch_heartbeat(BRIDGE)
+        self._patch("running_process", lambda _cfg: "python -m agent2telegram run")
+        ok, message = self.supervise.ensure_running(BRIDGE, "/x/config.json")
+        self.assertTrue(ok)
+        self.assertIn("already running", message)
+
+    def test_a_process_that_is_not_consuming_is_never_duplicated(self):
+        self._patch("running_process", lambda _cfg: "python -m agent2telegram run")
+        self._patch("RECHECK", 0.2)               # do not really wait out a flood-control sleep
+        launched = []
+        self._patch("_launch", lambda *a, **k: launched.append(a))
+        ok, message = self.supervise.ensure_running(BRIDGE, "/x/config.json", timeout=0.1)
+        self.assertFalse(ok)
+        self.assertIn("not draining", message)
+        self.assertEqual(launched, [])            # crucially: we did NOT start another one
+
+    def test_the_start_lock_admits_only_one_starter(self):
+        self.assertTrue(self.supervise._acquire_lock(BRIDGE))
+        self.assertFalse(self.supervise._acquire_lock(BRIDGE))
+        self.supervise._release_lock(BRIDGE)
+        self.assertTrue(self.supervise._acquire_lock(BRIDGE))
+
+    def test_a_crashed_starter_does_not_wedge_the_lock_forever(self):
+        self.assertTrue(self.supervise._acquire_lock(BRIDGE))
+        lock = os.path.join(core.bridge_dir(BRIDGE), "start.lock")
+        os.utime(lock, (0, 0))                    # left behind long ago
+        self.assertTrue(self.supervise._acquire_lock(BRIDGE))
+
+    def test_session_name_is_derived_from_the_bridge(self):
+        self.assertEqual(self.supervise.session_name("qwen telegram"), "a2t-qwen_telegram")
 
 
 # --------------------------------------------------------------------------- installer

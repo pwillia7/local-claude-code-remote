@@ -173,13 +173,16 @@ class AttachBridge:
             return None
         return RemoteControlMirror(
             slug,
-            send_plain_id=lambda text: self.tg.send_plain_id(self._owner_chat, text),
-            edit_plain=lambda mid, text: self.tg.edit_plain(self._owner_chat, mid, text),
+            send_plain_id=lambda text, parse_mode=None, reply_markup=None: self.tg.send_plain_id(
+                self._owner_chat, text, parse_mode=parse_mode, reply_markup=reply_markup),
+            edit_plain=lambda mid, text, parse_mode=None, reply_markup=None: self.tg.edit_plain(
+                self._owner_chat, mid, text, parse_mode=parse_mode, reply_markup=reply_markup),
             send_text=lambda text, parse_mode="auto": self._send_final(text, parse_mode=parse_mode),
             status_push=self._status_push,
             status_clear=self._status_clear,
             set_active=lambda on: (self._remote_active.set() if on
                                    else self._remote_active.clear()),
+            answer_callback_query=self.tg.answer_callback_query,
         )
 
     # ---- transcript resolution --------------------------------------------
@@ -468,7 +471,9 @@ class AttachBridge:
     # ---- inbound (Telegram → session) -------------------------------------
     def _inbound_loop(self) -> None:
         offset = 0
-        allowed_updates = json.dumps(["message", "edited_message", "message_reaction"])
+        # callback_query carries inline-button presses — the remote permission Allow/Deny.
+        allowed_updates = json.dumps(
+            ["message", "edited_message", "message_reaction", "callback_query"])
         while not self._stop.is_set():
             try:
                 updates = self.tg._call(
@@ -489,6 +494,16 @@ class AttachBridge:
                     log.exception("inbound error: %s", e)
 
     def _handle(self, upd: dict) -> None:
+        # Inline-button press (remote permission Allow/Deny). Authorization is checked inside,
+        # against the same allow-list that gates every other inbound update.
+        cq = upd.get("callback_query")
+        if cq:
+            if self._remote is not None:
+                self._remote.handle_callback(cq, self._allowed)
+            elif cq.get("id"):
+                self.tg.answer_callback_query(cq["id"], "No longer available.")
+            return
+
         # Reactions (e.g. ❤️) → quick-feedback line.
         mr = upd.get("message_reaction")
         if mr:

@@ -132,11 +132,30 @@ def cmd_toggle(args) -> int:
               "(pass --config or --tmux-session)")
         return 1
     bridge = cfg.get("tmux_session") or cfg_path.stem
+
+    # Enabling mirroring promises that a phone will show this session. Keep the promise: if
+    # nothing is draining the spool, start the bridge (never a second one — see supervise).
+    warning = ""
+    if not getattr(args, "no_bridge_start", False):
+        from . import supervise
+        started, message = supervise.ensure_running(bridge, str(cfg_path),
+                                                    python=sys.executable)
+        if not started:
+            warning = message
+
+    permissions = not getattr(args, "no_permission_prompts", False)
     core.bind_session(session_id, bridge=bridge, config_path=str(cfg_path),
-                      origins=_origins(cfg), label=args.label)
+                      origins=_origins(cfg), label=args.label,
+                      permissions=permissions,
+                      permission_timeout=getattr(args, "permission_timeout",
+                                                 core.PERMISSION_TIMEOUT))
+    extra = ("\nPermission requests can be approved from here."
+             if permissions else "\nPermission requests are notification-only.")
     ok = _notify(cfg, f"🟢 **{args.label} connected**\n\n"
-                      "Local activity will now be mirrored here.")
-    print("REMOTE_ENABLED" if ok else "REMOTE_ENABLED_WITH_WARNING")
+                      "Local activity will now be mirrored here." + extra)
+    if warning:
+        print(f"WARNING: {warning}")
+    print("REMOTE_ENABLED" if (ok and not warning) else "REMOTE_ENABLED_WITH_WARNING")
     return 0
 
 
@@ -148,10 +167,13 @@ def cmd_status(args) -> int:
             print(f"disabled  session={session_id}")
             return 1
         bridge = binding["bridge"]
+        from . import supervise
+        state, _ = supervise.status(bridge, binding.get("config", ""))
         print(f"enabled   session={session_id} bridge={bridge} "
               f"origin={core.get_origin(bridge, session_id)} "
               f"pending={core.pending_count(bridge)} "
-              f"consumer={'live' if core.consumer_alive(bridge) else 'down'}")
+              f"consumer={state} "
+              f"permissions={'remote' if binding.get('permissions', True) else 'notify-only'}")
         return 0
     root = Path(core.sessions_dir())
     rows = sorted(root.glob("*.json")) if root.is_dir() else []
@@ -203,6 +225,14 @@ def add_parser(sub) -> None:
                        help="bridge to use, by tmux session name (default: the current seat)")
         p.add_argument("--label", default=DEFAULT_LABEL,
                        help="user-facing name used in the connect/disconnect notices")
+        p.add_argument("--no-permission-prompts", action="store_true",
+                       help="surface permission requests as a notice only, with no Allow/Deny "
+                            "buttons (decisions then happen at the terminal only)")
+        p.add_argument("--permission-timeout", type=float, default=core.PERMISSION_TIMEOUT,
+                       help="seconds to wait for a remote Allow/Deny before falling back to "
+                            f"the terminal prompt (default: {core.PERMISSION_TIMEOUT:.0f})")
+        p.add_argument("--no-bridge-start", action="store_true",
+                       help="do not start the Agent2Telegram bridge if it is not running")
         return p
 
     _common(rcs.add_parser("toggle", help="turn mirroring on or off for one session"))
@@ -224,6 +254,11 @@ def add_parser(sub) -> None:
     ins.add_argument("--label", default=DEFAULT_LABEL,
                      help="user-facing name shown by the Skill and its notices")
     ins.add_argument("--python", default="", help="interpreter for the hook command")
+    ins.add_argument("--no-permission-prompts", action="store_true",
+                     help="install without remote Allow/Deny buttons (notification only)")
+    ins.add_argument("--permission-timeout", type=float, default=core.PERMISSION_TIMEOUT,
+                     help="seconds a permission request waits for a remote answer "
+                          f"(default: {core.PERMISSION_TIMEOUT:.0f})")
     ins.add_argument("--dry-run", action="store_true", help="report changes without making them")
 
     un = rcs.add_parser("uninstall", help="remove this project's hooks, Skill and state")

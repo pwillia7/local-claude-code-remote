@@ -101,21 +101,29 @@ Extra hard rules for that layer:
 
 1. **The hook path stays fast and local.** `remote_control/core.py` is executed once per hook
    event (including once per `MessageDisplay` delta). It must stay standard-library only, keep
-   its imports cheap, and never do network I/O, subprocesses, transcript scanning or sleeping.
-   It also must have **no relative imports** — it is registered as a plain script run with
+   its imports cheap, and never do network I/O, subprocesses or transcript scanning. It also
+   must have **no relative imports** — it is registered as a plain script run with
    `python3 -S -E`, which is what keeps start-up under ~20 ms.
+   The single exception is `PermissionRequest`, which waits on a local decision file: there
+   Claude Code is already stopped asking a human, so the wait costs nothing that was not being
+   spent anyway. Do not add a second waiting event.
 2. **Fail open.** Any error in mirroring exits 0. A broken mirror must never break Claude Code.
 3. **Never mirror a Telegram-originated turn.** `UserPromptSubmit` records the origin; the
    attach path already owns those turns and a second copy is a user-visible bug.
-4. **Never auto-approve a permission.** `PermissionRequest` is notification-only. Do not add
-   `--dangerously-skip-permissions`, do not change the permission mode, do not simulate an
-   approval with tmux keystrokes.
+4. **Never auto-approve a permission.** A decision comes from a person pressing a button or it
+   does not come at all: no timers, no heuristics, no model. Check the presser against
+   `allowed_user_ids`, honour a request once, and treat a timeout as *no decision* (print
+   nothing) rather than consent. Do not add `--dangerously-skip-permissions`, do not change the
+   permission mode, do not simulate an approval with tmux keystrokes.
 5. **Never retain event payloads.** A spool file is deleted as soon as it has been applied. Do
    not log message content — log types, counts and ids only.
-6. **The installer is additive.** It merges its own hook entries into `settings.json`, backs the
+6. **Never start a second Telegram poller.** Telegram gives each update to exactly one
+   `getUpdates` consumer, so two bridges make messages disappear at random. When in doubt about
+   whether one is running, do nothing and say so — see `remote_control/supervise.py`.
+7. **The installer is additive.** It merges its own hook entries into `settings.json`, backs the
    file up first, and must leave every other hook byte-for-byte alone. Keep it idempotent, and
    keep `uninstall` symmetrical with `install`.
-7. **No machine-specific paths in the package.** `$HOME`, a tmux session name or a CCR profile
+8. **No machine-specific paths in the package.** `$HOME`, a tmux session name or a CCR profile
    name belong in configuration, the installer's arguments, or `examples/` — never in source.
 
 Run the whole suite with `python3 -m unittest discover -s tests -v` (stdlib only, no network)

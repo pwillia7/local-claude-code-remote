@@ -54,12 +54,18 @@ The hook side never talks to the network. The bridge side never reads a hook.
 | `MessageDisplay` | Stream assistant text. |
 | `PreToolUse` | Tool status bubble. |
 | `PostToolUseFailure` | Tool failure in the bubble. |
-| `PermissionRequest` | Notify that a decision is pending (never decide). |
+| `PermissionRequest` | Ask the chat to decide (Allow/Deny buttons) and **block** on the answer; fall back to the terminal prompt if nobody presses one. |
 | `Notification` | `idle_prompt`, `agent_needs_input`, `agent_completed` only. `permission_prompt` is skipped — `PermissionRequest` already covers it. |
 | `SubagentStart` / `SubagentStop` | Subagent progress in the bubble. |
 | `TaskCreated` / `TaskCompleted` | Task progress in the bubble. |
 | `Stop` | End the turn; finalize streamed messages; `last_assistant_message` as a **backstop only**. |
 | `StopFailure` | End the turn on an API error (`Stop` never fires); report `error_type` / `error_message`. |
+
+`PermissionRequest` is the single event where the hook deliberately *waits*. It is not a
+contradiction of the "hooks return immediately" rule but the reason for it: everywhere else the
+hook is on Claude Code's critical path, and here Claude Code is already stopped waiting for a
+human. Registered with a `timeout` of the wait plus 30 s, so our own graceful fallback fires
+first rather than Claude Code killing the hook mid-wait.
 
 `PostToolUse` is deliberately **not** registered: the bubble already shows the call, and the
 event carries `tool_output`, which is both large and the most likely place for a secret to be.
@@ -134,7 +140,37 @@ Stop / StopFailure      → bubble deleted
 It reuses `AttachBridge._status_push` / `._status_clear`, so there is exactly one status-bubble
 implementation and a bridge crash mid-turn still cleans up the orphan on restart.
 
-### 4. Turn end
+### 4. Permission approval (terminal-originated turns)
+
+```
+PreToolUse …
+Claude Code is about to ask for permission
+  └─ PermissionRequest hook
+       ├─ bridge not consuming?  → return immediately, terminal prompt (never hold the session)
+       ├─ spool {permission_request, request_id, tool, redacted detail, timeout}
+       └─ poll decisions/<request_id>.json every 100 ms, up to `permission_timeout`
+
+bridge, outbound thread : post a card with an inline keyboard
+                          callback_data = "p:<request_id>:a" | "p:<request_id>:d"
+bridge, inbound  thread : callback_query arrives
+                          ├─ presser not in allowed_user_ids → refuse, buttons stay live
+                          ├─ request already answered        → "no longer waiting"
+                          └─ write decisions/<request_id>.json, answerCallbackQuery,
+                             edit the card to ✅/⛔ and remove the keyboard
+
+hook wakes: prints {"hookSpecificOutput":{"hookEventName":"PermissionRequest",
+                                          "decision":"allow"|"deny"}}
+```
+
+If the timeout wins instead, the hook prints **nothing** — which the docs define as "the
+permission flow proceeds unchanged" — and spools `permission_expired` so the bridge retracts
+the buttons. Turn end retracts any card still live, because a press that decides nothing is
+worse than no button at all.
+
+Two threads touch the pending-card map (the outbound one posts, the inbound one resolves), so
+it is the one piece of mirror state under a lock.
+
+### 5. Turn end
 
 ```
 Stop → {turn_end}
@@ -147,7 +183,7 @@ Stop → {turn_end}
 The old "🖥️ Qwen finished + entire answer" message is gone: text arrives while the model works,
 and `Stop` adds nothing when it already did.
 
-### 5. Failure
+### 6. Failure
 
 ```
 StopFailure → {turn_failed}
@@ -177,7 +213,9 @@ remote-control/
     ├── enabled/<claude-session-id>       0600  authoritative "mirroring is on" marker
     ├── origin/<claude-session-id>.json   0600  terminal | telegram
     ├── events/<event-id>.json            0600  the spool
-    └── consumer_heartbeat                0600  bridge liveness
+    ├── decisions/<request-id>.json       0600  a remote Allow/Deny, collected by the waiting hook
+    ├── consumer_heartbeat                0600  bridge liveness
+    └── start.lock                        0600  held only while a bridge is being started
 ```
 
 The index exists so the hook needs **no tmux call and no config parse**: one `open()` answers
@@ -233,11 +271,20 @@ sleep, and holds no lock.
 
 ## Design decisions worth knowing
 
-**Why plain text while streaming.** A partially written Markdown span (an unclosed `**` or
-fence) makes Telegram reject the edit, and `editMessageText` failures are swallowed — so a
-rejected edit would silently lose the tail of an answer. Streamed messages therefore stay plain
-from first delta to `final`. The `Stop` backstop, which sends a complete message, still renders
-Markdown.
+**How Markdown survives streaming.** The obvious hazard is a half-written span: if `**bold`
+arrives before its closing `**`, a naive renderer emits an unbalanced tag, Telegram rejects the
+edit, and — because `editMessageText` failures used to be swallowed — the tail of the answer
+disappears. Two things make rendering safe:
+
+* `markdown_to_html` only emits a tag for a *closed* span, so an unterminated `**` or code fence
+  stays literal text and the HTML is always balanced;
+* every send and edit falls back to the raw text if Telegram rejects the rich version, and
+  `edit_plain` now reports success so the mirror can tell. Content is never traded for
+  formatting.
+
+Chunking measures the **raw** text (3000 chars) rather than the rendered form, because escaping
+only ever makes a message longer — `&` becomes `&amp;` — and the rendered chunk still has to fit
+Telegram's 4096. A chunk that somehow renders too long is sent as plain text instead.
 
 **Why the mirror runs in the bridge's outbound loop, not its own thread.** The status bubble,
 the durable send queue and the dedup ledger are single-threaded state owned by that loop.
@@ -246,6 +293,15 @@ Consuming there means the mirror reuses all of it without a lock.
 **Why `_turn_active` was left alone.** That flag drives the Telegram-originated turn, including
 its idle fallback and its "never leave a Telegram turn unanswered" backstop. The mirror sets a
 separate `_remote_active`; the typing thread honours either.
+
+**Why the bridge starts itself, carefully.** Enabling mirroring is a promise that a phone will
+show the session, and "I turned it on and saw nothing" is the worst possible failure. So the
+toggle starts the bridge — but Telegram hands each update to exactly one `getUpdates` consumer,
+so starting a *second* one makes messages vanish at random. The process list decides whether
+anything is running and the heartbeat decides whether it is consuming; a running-but-quiet
+bridge is reported, never duplicated; an uninspectable process list falls back to trusting the
+heartbeat; and a lock file keeps two concurrent toggles from racing. A fresh heartbeat alone is
+not enough evidence — a bridge killed a second ago still has a one-second-old heartbeat.
 
 **Why origin defaults to `terminal`.** A session becomes Telegram-driven only when a prefixed
 prompt actually arrives. Anything else — including events before the first prompt — belongs to

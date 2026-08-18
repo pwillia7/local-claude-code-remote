@@ -31,7 +31,7 @@ EVENT_TIMEOUTS = {
     "MessageDisplay": 5,
     "PreToolUse": 5,
     "PostToolUseFailure": 5,
-    "PermissionRequest": 5,
+    "PermissionRequest": 5,          # replaced at install time — this one deliberately waits
     "Notification": 5,
     "SubagentStart": 5,
     "SubagentStop": 5,
@@ -40,6 +40,10 @@ EVENT_TIMEOUTS = {
     "Stop": 5,
     "StopFailure": 5,
 }
+
+#: Headroom on top of the remote-approval wait, so OUR timeout fires first and falls back to
+#: the terminal prompt gracefully, rather than Claude Code killing the hook mid-wait.
+PERMISSION_HOOK_HEADROOM = 30
 
 #: Events that also need Agent2Telegram's own turn-end signal, so the attach bridge stops its
 #: typing indicator and clears its status bubble at the exact end of a turn (including failures).
@@ -157,16 +161,21 @@ def _skill_source() -> Path:
 
 
 def render_skill(dest: Path, *, skill_name: str, label: str, python: str,
-                 config: str = "") -> list[str]:
+                 config: str = "", permissions: bool = True,
+                 permission_timeout: float = core.PERMISSION_TIMEOUT) -> list[str]:
     """Materialize the Skill with this machine's paths. Returns the files written."""
     src = _skill_source()
     config_arg = f" \\\n    --config {shlex.quote(config)}" if config else ""
+    perm_args = f" \\\n    --permission-timeout {permission_timeout:g}"
+    if not permissions:
+        perm_args += " \\\n    --no-permission-prompts"
     subs = {
         "{{SKILL_NAME}}": skill_name,
         "{{LABEL}}": label,
         "{{LABEL_SHELL}}": shlex.quote(label),
         "{{PYTHON}}": shlex.quote(python),
         "{{CONFIG_ARG}}": config_arg,
+        "{{PERMISSION_ARGS}}": perm_args,
     }
     written = []
     for rel in ("SKILL.md", "scripts/remote.sh"):
@@ -221,12 +230,18 @@ def install(args) -> int:
     dry = getattr(args, "dry_run", False)
 
     # ---- Skill
+    permissions = not getattr(args, "no_permission_prompts", False)
+    permission_timeout = float(getattr(args, "permission_timeout", core.PERMISSION_TIMEOUT))
     if dry:
         changes.append(f"would install Skill → {skill_dir}")
     else:
         written = render_skill(skill_dir, skill_name=skill_name, label=label,
-                               python=python, config=str(cfg_path))
+                               python=python, config=str(cfg_path),
+                               permissions=permissions, permission_timeout=permission_timeout)
         changes.append(f"installed Skill → {skill_dir} ({len(written)} files)")
+    changes.append("remote permission approval: "
+                   + (f"on (waits {permission_timeout:g}s, then the terminal prompt)"
+                      if permissions else "off (notification only)"))
 
     # ---- settings.json
     settings_path = cdir / "settings.json"
@@ -242,8 +257,11 @@ def install(args) -> int:
         print(f"✗ {settings_path}: 'hooks' is not an object", file=sys.stderr)
         return 2
 
+    timeouts = dict(EVENT_TIMEOUTS)
+    # The approval hook blocks on purpose while a human decides, so it needs a real budget.
+    timeouts["PermissionRequest"] = int(permission_timeout) + PERMISSION_HOOK_HEADROOM
     removed_total = 0
-    for event, timeout in EVENT_TIMEOUTS.items():
+    for event, timeout in timeouts.items():
         groups = hooks.get(event) or []
         if not isinstance(groups, list):
             problems.append(f"hooks.{event} is not a list — left untouched")
@@ -272,13 +290,13 @@ def install(args) -> int:
         changes.append(f"{settings_path}: already up to date")
     elif dry:
         changes.append(f"would update {settings_path} "
-                       f"({len(EVENT_TIMEOUTS)} events, {removed_total} stale entries removed)")
+                       f"({len(timeouts)} events, {removed_total} stale entries removed)")
     else:
         backup = _backup(settings_path)
         _write_settings(settings_path, settings)
         changes.append(f"backed up {settings_path} → {backup}" if backup else "created "
                        f"{settings_path}")
-        changes.append(f"registered {len(EVENT_TIMEOUTS)} hook events "
+        changes.append(f"registered {len(timeouts)} hook events "
                        f"({removed_total} stale/legacy entries removed)")
 
     print(("Dry run — nothing was changed.\n" if dry else "") + "\n".join("  • " + c

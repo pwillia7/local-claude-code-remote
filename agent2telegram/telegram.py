@@ -210,24 +210,46 @@ class TelegramClient:
                 self._backoff(attempt)
         raise TelegramError(f"download failed: {last}")
 
-    def send_plain_id(self, chat_id: int, text: str, *, parse_mode: str | None = None) -> int | None:
-        """Send a message and return its message_id (for editable status bubbles)."""
+    def send_plain_id(self, chat_id: int, text: str, *, parse_mode: str | None = None,
+                      reply_markup: dict | None = None) -> int | None:
+        """Send a message and return its message_id (for editable status bubbles).
+
+        ``reply_markup`` attaches an inline keyboard — used for the remote permission prompt."""
         params = {"chat_id": chat_id, "text": text, "disable_web_page_preview": "true"}
         if parse_mode:
             params["parse_mode"] = parse_mode
+        if reply_markup is not None:
+            params["reply_markup"] = json.dumps(reply_markup)
         try:
             return self._call("sendMessage", params, timeout=SEND_TIMEOUT).get("message_id")
         except TelegramError:
             return None
 
-    def edit_plain(self, chat_id: int, message_id: int, text: str, *, parse_mode: str | None = None) -> None:
+    def edit_plain(self, chat_id: int, message_id: int, text: str, *, parse_mode: str | None = None,
+                   reply_markup: dict | None = None) -> bool:
+        """Edit a message. Returns whether Telegram accepted it, so a caller that tried a
+        rich parse_mode can retry as plain text instead of silently losing the new content."""
         params = {"chat_id": chat_id, "message_id": message_id, "text": text}
         if parse_mode:
             params["parse_mode"] = parse_mode
+        if reply_markup is not None:
+            params["reply_markup"] = json.dumps(reply_markup)
         try:
             self._call("editMessageText", params, timeout=SEND_TIMEOUT)
+            return True
+        except TelegramError as e:
+            # "message is not modified" means the text already matches — treat as success.
+            return "not modified" in str(e)
+
+    def answer_callback_query(self, callback_id: str, text: str = "") -> None:
+        """Acknowledge an inline-button press so Telegram stops showing its spinner."""
+        params = {"callback_query_id": callback_id}
+        if text:
+            params["text"] = text
+        try:
+            self._call("answerCallbackQuery", params, timeout=SEND_TIMEOUT, retries=1)
         except TelegramError:
-            pass
+            pass                     # cosmetic; the decision has already been recorded
 
     def delete_message(self, chat_id: int, message_id: int) -> None:
         try:

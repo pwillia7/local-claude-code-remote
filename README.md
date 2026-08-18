@@ -51,7 +51,7 @@ Enable it for a session and your phone shows the local seat, live:
 | a subagent or task runs | `🤖 Explore running`, `📋 Working: reconcile pending transactions` |
 | the turn ends | the bubble disappears; the answer stays |
 | the API errors out | `⚠️ Turn ended with an error (overloaded)` |
-| a tool needs permission | `🔐 Waiting for permission` — **notification only** |
+| a tool needs permission | `🔐 Permission needed` with **✅ Allow / ⛔ Deny** buttons — press one and the session continues |
 
 It works in both directions: messages you send **from** Telegram drive the same live tmux
 session through Agent2Telegram's existing attach mode, exactly as before.
@@ -69,16 +69,42 @@ session through Agent2Telegram's existing attach mode, exactly as before.
 * **No terminal scraping and no transcript parsing** on the local-mirror path. Assistant text
   comes from the documented `MessageDisplay` hook.
 * **Hooks do no network I/O.** They write one small file and exit; the long-running bridge does
-  every Telegram call.
+  every Telegram call. The one hook that waits — the permission prompt — waits on a local file,
+  and only while Claude Code is already stopped asking a human anyway.
 * **Telegram-originated turns are never duplicated.** `UserPromptSubmit` classifies each turn's
   origin, and the mirror only ever handles terminal-originated ones.
+* **Permissions are decided by a human, remotely or locally.** A permission request goes to the
+  chat with Allow/Deny buttons; if nobody answers in time the normal terminal prompt appears.
+  Nothing is ever auto-approved.
+* **The bridge starts itself.** Enabling mirroring launches the bridge if it isn't running —
+  and refuses to start a second one, because Telegram allows exactly one poller per bot.
 * **Qwen through CCR is the reference configuration** — see
   [`docs/QWEN_CCR_SETUP.md`](docs/QWEN_CCR_SETUP.md). Nothing in the package is Qwen-specific.
 
-**Current limitation:** remote permission approval is **notification-only**. You are told that
-Claude Code is waiting for a decision; you still make that decision at the terminal. Nothing is
-ever auto-approved, no `--dangerously-skip-permissions` is added, and your permission mode is
-never weakened.
+### Approving permissions from your phone
+
+When Claude Code needs permission, the chat gets a card naming the tool and showing a redacted
+one-line detail, with **✅ Allow** and **⛔ Deny** buttons:
+
+```
+🔐 Permission needed
+
+Bash
+🛠️ Remove the build directory
+rm -rf ./build
+```
+
+Press one and Claude Code continues immediately. The mechanics:
+
+* only [allow-listed](docs/SECURITY.md) Telegram users can press the buttons — the same people
+  who can already send prompts into the session;
+* the hook waits up to 90 s (`--permission-timeout`), then gives up and the **normal terminal
+  prompt appears** — an unanswered phone never blocks the keyboard for long;
+* nothing is auto-approved, no `--dangerously-skip-permissions` is added, and your permission
+  mode is never weakened — a `deny` rule in your settings still wins over an Allow press;
+* the buttons are retracted once the request is answered, expires, or the turn ends, so a stale
+  press can never decide anything;
+* prefer the old behaviour? `--no-permission-prompts` makes it a notification again.
 
 ---
 
@@ -152,7 +178,9 @@ Then start the bridge (see `python3 -m agent2telegram service` for a systemd/lau
 python3 -m agent2telegram run
 ```
 
-Run **exactly one** bridge per bot token — Telegram allows only one long-poll consumer.
+Run **exactly one** bridge per bot token — Telegram allows only one long-poll consumer. You do
+not have to start it by hand: enabling mirroring starts it for you (and detects an existing one
+rather than adding a second).
 
 ## Use
 
@@ -196,8 +224,9 @@ run and pass. The changes are additive:
 
 | File | Change |
 | --- | --- |
-| `agent2telegram/remote_control/` | **new** — hook adapter, spool, mirror, CLI, installer, Skill template |
-| `agent2telegram/attach.py` | consume the spool in the outbound loop; the typing indicator honours the mirror; the durable send path takes a `parse_mode` |
+| `agent2telegram/remote_control/` | **new** — hook adapter, spool, mirror, CLI, installer, bridge supervision, Skill template |
+| `agent2telegram/attach.py` | consume the spool in the outbound loop; route `callback_query` updates to the mirror; the typing indicator honours the mirror; the durable send path takes a `parse_mode` |
+| `agent2telegram/telegram.py` | inline keyboards on send/edit, `answerCallbackQuery`, and `edit_plain` now reports success so a caller can fall back to plain text |
 | `agent2telegram/readers.py` | the Claude tool summarizer moved to `remote_control.core` so the hook path shares it |
 | `agent2telegram/__main__.py` | the `remote-control` command |
 | `tests/test_remote_control.py` | **new** |

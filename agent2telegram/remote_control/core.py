@@ -73,6 +73,18 @@ NON_TERMINAL_END_REASONS = ("clear", "resume")
 #: PermissionRequest already covers it and we do not want the same event twice.
 ACTIONABLE_NOTIFICATIONS = ("idle_prompt", "agent_needs_input", "agent_completed")
 
+#: How long a PermissionRequest hook waits for a remote Allow/Deny before giving up and letting
+#: the normal terminal prompt appear. This is the ONE place the hook deliberately blocks: Claude
+#: Code is already stopped waiting for a human, so waiting costs nothing that was not already
+#: being spent — but it must stay short enough that someone sitting at the keyboard is not
+#: locked out of their own prompt for long.
+PERMISSION_TIMEOUT = 90.0
+#: Poll interval while waiting for the decision file (a few hundred stats over the whole wait).
+PERMISSION_POLL = 0.1
+#: An answered-but-never-collected decision (the hook died, Claude Code was killed) is swept
+#: after this long so the directory cannot accumulate.
+DECISION_TTL = 3600.0
+
 
 # --------------------------------------------------------------------------- paths
 
@@ -119,6 +131,14 @@ def events_dir(bridge: str) -> str:
 
 def heartbeat_path(bridge: str) -> str:
     return os.path.join(bridge_dir(bridge), "consumer_heartbeat")
+
+
+def decisions_dir(bridge: str) -> str:
+    return os.path.join(bridge_dir(bridge), "decisions")
+
+
+def decision_path(bridge: str, request_id: str) -> str:
+    return os.path.join(decisions_dir(bridge), slug(request_id) + ".json")
 
 
 def _mkdir_private(path: str) -> None:
@@ -175,7 +195,8 @@ def _read_json(path: str):
 # --------------------------------------------------------------------------- binding / enable
 
 def bind_session(session_id: str, *, bridge: str, config_path: str = "",
-                 origins=(), label: str = "") -> None:
+                 origins=(), label: str = "", permissions: bool = True,
+                 permission_timeout: float = PERMISSION_TIMEOUT) -> None:
     """Turn Remote Control ON for one Claude session.
 
     The binding file is the hook's fast path: one ``open()`` tells it whether this session is
@@ -188,6 +209,8 @@ def bind_session(session_id: str, *, bridge: str, config_path: str = "",
         "config": config_path,
         "origins": prefixes,
         "label": label,
+        "permissions": bool(permissions),
+        "permission_timeout": float(permission_timeout),
         "since": time.time(),
     }, ensure_ascii=False))
 
@@ -306,6 +329,31 @@ def ack_event(path: str) -> None:
     _unlink(path)
 
 
+def write_decision(bridge: str, request_id: str, decision: str, by=None) -> None:
+    """Record a remote Allow/Deny. The waiting hook picks it up and deletes it."""
+    _write_private(decision_path(bridge, request_id), json.dumps(
+        {"decision": decision, "by": by, "ts": time.time()}, ensure_ascii=False))
+
+
+def sweep_decisions(bridge: str, ttl: float = DECISION_TTL) -> int:
+    """Delete decisions no hook ever collected (it died, or Claude Code was killed)."""
+    d = decisions_dir(bridge)
+    now, removed = time.time(), 0
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return 0
+    for name in names:
+        path = os.path.join(d, name)
+        try:
+            if now - os.stat(path).st_mtime > ttl:
+                _unlink(path)
+                removed += 1
+        except OSError:
+            pass
+    return removed
+
+
 def touch_heartbeat(bridge: str) -> None:
     try:
         _mkdir_private(bridge_dir(bridge))
@@ -404,6 +452,32 @@ def subagent_summary(agent_type: str) -> str:
     return "🤖 " + short(agent_type or "subagent") + " running"
 
 
+def permission_detail(name: str, inp) -> str:
+    """A few extra lines of context for an approval card.
+
+    Deciding "allow" on a one-line summary is not really deciding, so this shows more than the
+    bubble does — but still only known-safe fields, still redacted, still length-capped. The
+    raw ``tool_input`` is never dumped.
+    """
+    inp = inp if isinstance(inp, dict) else {}
+    if name == "Bash":
+        return short(redact(inp.get("command", "")), 300)
+    if name in ("Edit", "Write", "NotebookEdit", "Read"):
+        return short(inp.get("file_path", ""), 200)
+    if name in ("Grep", "Glob"):
+        return short(redact(inp.get("pattern", "")), 200)
+    if name in ("WebFetch",):
+        return short(inp.get("url", ""), 200)
+    if name == "WebSearch":
+        return short(redact(inp.get("query", "")), 200)
+    if name in ("Agent", "Task"):
+        return short(redact(inp.get("description", "")), 200)
+    if name.startswith("mcp__"):
+        # MCP arguments are arbitrary and server-defined: name the fields, never their values.
+        return "arguments: " + short(", ".join(sorted(inp)) or "none", 200)
+    return ""
+
+
 # --------------------------------------------------------------------------- hook adapter
 
 def _emit(bridge: str, session_id: str, kind: str, **fields) -> str:
@@ -436,24 +510,84 @@ def _handle_session_end(payload: dict, binding: dict) -> None:
     unbind_session(session_id, bridge)
 
 
-def handle(payload: dict) -> int:
-    """Translate one Claude Code hook payload into (at most) one spooled mirror event."""
+def _await_decision(bridge: str, request_id: str, timeout: float):
+    """Block until the bridge records a decision for *request_id*, or until *timeout*.
+
+    Polling a file is deliberate: the hook must never open a second Telegram connection — the
+    long-running bridge owns the only one — and it must not depend on signals or sockets.
+    """
+    path = decision_path(bridge, request_id)
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
+        data = _read_json(path)
+        if isinstance(data, dict) and data.get("decision") in ("allow", "deny"):
+            _unlink(path)
+            return data
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(PERMISSION_POLL)
+
+
+def _handle_permission(payload: dict, binding: dict):
+    """Ask Telegram to decide, or just report that a decision is pending.
+
+    Returns the hook's JSON output (a decision) or None, which leaves Claude Code's normal
+    permission flow completely untouched — that is the fallback for every failure mode here:
+    no bridge, mirroring disabled, nobody answers in time.
+    """
+    bridge = binding["bridge"]
+    session_id = payload.get("session_id", "")
+    tool = payload.get("tool_name", "")
+    summary = tool_summary(tool, payload.get("tool_input"))
+
+    if not binding.get("permissions", True):
+        _emit(bridge, session_id, "permission", summary=summary, tool_name=short(tool, 40))
+        return None
+    if not consumer_alive(bridge):
+        # Nobody is reading the spool, so nobody can answer. Do not hold the session hostage.
+        return None
+
+    request_id = os.urandom(8).hex()
+    timeout = float(binding.get("permission_timeout") or PERMISSION_TIMEOUT)
+    if not _emit(bridge, session_id, "permission_request", request_id=request_id,
+                 tool_name=short(tool, 40), summary=summary,
+                 detail=permission_detail(tool, payload.get("tool_input")),
+                 timeout=timeout):
+        return None                                   # spool full → fall back to the terminal
+
+    decision = _await_decision(bridge, request_id, timeout)
+    if decision is None:
+        # Tell the chat the buttons are dead, then let the terminal prompt appear as normal.
+        _emit(bridge, session_id, "permission_expired", request_id=request_id)
+        return None
+
+    out = {"hookEventName": "PermissionRequest", "decision": decision["decision"]}
+    if decision["decision"] == "deny":
+        out["reason"] = "Denied from Telegram."
+    return {"hookSpecificOutput": out}
+
+
+def handle(payload: dict):
+    """Translate one Claude Code hook payload into (at most) one spooled mirror event.
+
+    Returns the hook's JSON output, or None for "say nothing". Only PermissionRequest ever
+    returns anything."""
     event = payload.get("hook_event_name", "")
     session_id = payload.get("session_id", "")
 
     # SessionStart runs before/independently of any binding — it is what clears one.
     if event == "SessionStart":
         _handle_session_start(payload)
-        return 0
+        return None
 
     binding = session_binding(session_id)
     if binding is None:
-        return 0                                  # not mirrored → the common case, ~0 work
+        return None                               # not mirrored → the common case, ~0 work
     bridge = binding["bridge"]
 
     if event == "SessionEnd":
         _handle_session_end(payload, binding)
-        return 0
+        return None
 
     if event == "UserPromptSubmit":
         text = payload.get("user_input", "") or ""
@@ -461,12 +595,12 @@ def handle(payload: dict) -> int:
         set_origin(bridge, session_id, origin, payload.get("prompt_id", ""))
         if origin == "terminal":
             _emit(bridge, session_id, "prompt", text=text)
-        return 0
+        return None
 
     # Everything below mirrors the LOCAL seat only. Telegram-originated turns are already
     # forwarded by the attach bridge; mirroring them here would double every message.
     if get_origin(bridge, session_id) != "terminal":
-        return 0
+        return None
 
     if event == "MessageDisplay":
         _emit(bridge, session_id, "message",
@@ -484,9 +618,7 @@ def handle(payload: dict) -> int:
               summary=tool_summary(payload.get("tool_name", ""), payload.get("tool_input")),
               error=short(redact(payload.get("error", "")), 160))
     elif event == "PermissionRequest":
-        _emit(bridge, session_id, "permission",
-              summary=tool_summary(payload.get("tool_name", ""), payload.get("tool_input")),
-              tool_name=short(payload.get("tool_name", ""), 40))
+        return _handle_permission(payload, binding)
     elif event == "Notification":
         kind = payload.get("notification_type", "")
         if kind in ACTIONABLE_NOTIFICATIONS:
@@ -510,15 +642,21 @@ def handle(payload: dict) -> int:
         _emit(bridge, session_id, "turn_failed",
               error_type=short(payload.get("error_type", "unknown"), 40),
               error_message=short(redact(payload.get("error_message", "")), 400))
-    return 0
+    return None
 
 
-def hook_main(stdin=None) -> int:
-    """Entry point for the registered hook command. Always exits 0 (fail open)."""
+def hook_main(stdin=None, stdout=None) -> int:
+    """Entry point for the registered hook command. Always exits 0 (fail open).
+
+    Prints JSON only for a PermissionRequest that was actually decided remotely; every other
+    event, and every failure, produces no output at all — which leaves Claude Code's own
+    behaviour exactly as it would have been without this hook."""
     try:
         payload = json.load(stdin if stdin is not None else sys.stdin)
-        if isinstance(payload, dict):
-            handle(payload)
+        out = handle(payload) if isinstance(payload, dict) else None
+        if out:
+            (stdout if stdout is not None else sys.stdout).write(
+                json.dumps(out, ensure_ascii=False))
     except Exception:
         pass                                      # a broken mirror never breaks Claude Code
     return 0
