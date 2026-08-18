@@ -397,7 +397,7 @@ aside.
 | [`docs/UPSTREAM_README.md`](docs/UPSTREAM_README.md) | upstream Agent2Telegram's README, verbatim |
 | [`skills/`](skills) | the `local-remote-setup` agent playbook — let Claude Code install this for you |
 | [`CHANGELOG.md`](CHANGELOG.md) | what this fork added, in order |
-| [`examples/`](examples) | sanitized launcher, shell integration and bridge config |
+| [`examples/`](examples) | sanitized launcher, shell integration, bridge config, and `claude-profile-skills` |
 
 ## Compatibility
 

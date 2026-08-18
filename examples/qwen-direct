@@ -23,6 +23,15 @@ if ! "$CCR_BIN" start --no-open >/dev/null 2>&1; then
     exit 1
 fi
 
+# Personal skills live in ~/.claude/skills, but this session's CLAUDE_CONFIG_DIR is the CCR
+# profile — so `npx skills add --global` (or any other personal install) is invisible here until
+# it is linked across. Report it once per launch, before the TUI takes over. Deliberately here
+# and not in a SessionStart hook: that hook's stdout is injected into the model's context, and a
+# housekeeping notice should cost zero tokens.
+if command -v claude-profile-skills >/dev/null 2>&1; then
+    claude-profile-skills --check 2>/dev/null || true
+fi
+
 # CCR sets CLAUDE_CONFIG_DIR to this profile's own Claude directory, so the profile's
 # settings.json, hooks and skills apply — and never touch ~/.claude.
 exec "$CCR_BIN" "<ccr-profile>" cli -- "$@"

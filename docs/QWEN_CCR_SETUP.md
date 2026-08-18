@@ -158,6 +158,35 @@ up to. From then on, everything you do at the terminal appears there until you r
 From the chat you can also send `/stop` to interrupt a turn, and agent commands like `/compact`,
 `/context` or `/model <name>`.
 
+## Skills are per-config-directory
+
+A trap worth knowing about, because it fails silently. Claude Code reads *personal* skills from
+`$CLAUDE_CONFIG_DIR/skills`, and this harness sets that to the CCR profile — so
+`npx skills add --global`, or anything else that installs into `~/.claude/skills`, lands
+somewhere this session never looks. Nothing errors; the skill simply is not there.
+
+Project-level skills (`<repo>/.claude/skills/`) are unaffected: they are read from the working
+directory and do not care about `CLAUDE_CONFIG_DIR`.
+
+[`examples/claude-profile-skills`](../examples/claude-profile-skills) reports the difference and
+links across the ones you pick:
+
+```bash
+claude-profile-skills                    # installed personally, not visible here
+claude-profile-skills link agent-browser # symlink it into the profile
+claude-profile-skills ignore sanity-migration   # and stop mentioning that one
+```
+
+It links rather than copies, so editing the personal skill updates both, and it only ever removes
+links it made itself. Wire `claude-profile-skills --check` into the launcher (see
+[`examples/qwen-direct`](../examples/qwen-direct)) and you get a one-line notice at launch when
+something new shows up.
+
+It notifies rather than linking automatically on purpose. Each linked skill adds its frontmatter
+to every session's system prompt — small, roughly 50–200 tokens each — but a smaller local model
+also gets worse at choosing between skills as the menu grows, and a *wrongly* chosen skill loads
+its whole body. Deciding once per skill is cheaper than either.
+
 ## After a reboot
 
 Worth knowing which links come back on their own and which you bring back by hand:

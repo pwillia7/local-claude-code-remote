@@ -1,0 +1,172 @@
+#!/usr/bin/env python3
+"""Keep a Claude Code *profile* aware of skills installed at the personal level.
+
+A harness that runs Claude Code with its own ``CLAUDE_CONFIG_DIR`` — a CCR profile, say — does
+not see ``~/.claude/skills``. Personal skills are read from ``$CLAUDE_CONFIG_DIR/skills``, so
+``npx skills add --global`` (or any other install into ``~/.claude/skills``) lands somewhere the
+harness never looks, silently.
+
+This reports the difference and links across the ones you choose. It deliberately does **not**
+link automatically: a small local model gets worse at picking skills as the menu grows, so which
+ones cross over is a decision worth making once, per skill.
+
+    claude-profile-skills                 # what's available but not linked
+    claude-profile-skills link NAME…      # symlink those into the profile
+    claude-profile-skills link --all      # symlink everything missing
+    claude-profile-skills ignore NAME…    # never mention these again
+    claude-profile-skills unlink NAME…    # remove a link this tool made
+    claude-profile-skills --check         # one quiet line, for a launcher to print
+
+Symlinks, not copies, so editing the personal skill updates both. Only links this tool created
+are ever removed — a real directory in the profile is left alone.
+"""
+from __future__ import annotations
+
+import argparse
+import glob
+import os
+import sys
+from pathlib import Path
+
+STATE = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")) \
+    / "claude-profile-skills"
+IGNORE_FILE = STATE / "ignored"
+
+
+def personal_dir() -> Path:
+    return Path(os.environ.get("CLAUDE_PERSONAL_DIR", Path.home() / ".claude")) / "skills"
+
+
+def profile_dir() -> Path | None:
+    """The harness's own config dir. Explicit wins; otherwise find a single CCR profile."""
+    for env in ("CLAUDE_PROFILE_DIR", "CLAUDE_CONFIG_DIR"):
+        if os.environ.get(env):
+            return Path(os.environ[env]).expanduser() / "skills"
+    found = sorted(glob.glob(str(Path.home() / ".claude-code-router" / "profiles" / "*" / "claude")))
+    if len(found) == 1:
+        return Path(found[0]) / "skills"
+    return None                     # zero or ambiguous → make the caller say which
+
+
+def is_skill(p: Path) -> bool:
+    return (p / "SKILL.md").is_file()
+
+
+def ignored() -> set:
+    try:
+        return {ln.strip() for ln in IGNORE_FILE.read_text("utf-8").splitlines() if ln.strip()}
+    except OSError:
+        return set()
+
+
+def save_ignored(names: set) -> None:
+    STATE.mkdir(parents=True, exist_ok=True)
+    IGNORE_FILE.write_text("\n".join(sorted(names)) + "\n", encoding="utf-8")
+
+
+def survey(personal: Path, profile: Path):
+    """(missing, linked, ignored_missing) skill names."""
+    have = {p.name for p in profile.iterdir() if p.is_dir() and is_skill(p)} \
+        if profile.is_dir() else set()
+    theirs = {p.name for p in personal.iterdir() if p.is_dir() and is_skill(p)} \
+        if personal.is_dir() else set()
+    linked = {p.name for p in profile.iterdir() if p.is_symlink()} if profile.is_dir() else set()
+    skip = ignored()
+    missing = sorted(theirs - have - skip)
+    return missing, sorted(linked), sorted((theirs - have) & skip)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("command", nargs="?", default="list",
+                    choices=["list", "link", "ignore", "unignore", "unlink"])
+    ap.add_argument("names", nargs="*")
+    ap.add_argument("--all", action="store_true", help="apply to every missing skill")
+    ap.add_argument("--check", action="store_true",
+                    help="print one line only if something is missing; always exit 0")
+    ap.add_argument("--profile", default="", help="the harness's config dir")
+    ap.add_argument("--personal", default="", help="the personal config dir (default ~/.claude)")
+    args = ap.parse_args()
+
+    personal = Path(args.personal).expanduser() / "skills" if args.personal else personal_dir()
+    profile = Path(args.profile).expanduser() / "skills" if args.profile else profile_dir()
+    if profile is None:
+        if args.check:
+            return 0                                  # never let a launcher fail over this
+        print("Could not determine the profile skills dir — pass --profile.", file=sys.stderr)
+        return 2
+
+    missing, linked, skipped = survey(personal, profile)
+
+    if args.check:
+        # Deliberately terse and silent when there is nothing to say: this prints on every launch.
+        if missing:
+            names = ", ".join(missing[:4]) + (f" +{len(missing) - 4} more" if len(missing) > 4 else "")
+            print(f"⧉ {len(missing)} skill(s) installed for Claude Code but not in this profile: "
+                  f"{names}\n  claude-profile-skills link <name>   (or: ignore <name>)")
+        return 0
+
+    if args.command == "list":
+        print(f"personal : {personal}")
+        print(f"profile  : {profile}")
+        print()
+        if missing:
+            print("available here, NOT visible to this harness:")
+            for n in missing:
+                print(f"  + {n}")
+        else:
+            print("nothing missing — the profile sees every personal skill you haven't ignored.")
+        if linked:
+            print("\nlinked in by this tool:")
+            for n in linked:
+                print(f"  → {n}")
+        if skipped:
+            print("\nignored (use `unignore` to reconsider):")
+            for n in skipped:
+                print(f"  · {n}")
+        return 0
+
+    targets = missing if args.all else args.names
+    if not targets:
+        print("Name at least one skill, or pass --all.", file=sys.stderr)
+        return 2
+
+    if args.command == "ignore":
+        save_ignored(ignored() | set(targets))
+        print(f"ignoring: {', '.join(sorted(set(targets)))}")
+        return 0
+    if args.command == "unignore":
+        save_ignored(ignored() - set(targets))
+        print(f"no longer ignoring: {', '.join(sorted(set(targets)))}")
+        return 0
+
+    if args.command == "unlink":
+        for name in targets:
+            dest = profile / name
+            if dest.is_symlink():
+                dest.unlink()
+                print(f"  unlinked {name}")
+            elif dest.exists():
+                print(f"  skipped {name}: a real directory, not a link this tool made")
+            else:
+                print(f"  skipped {name}: not present")
+        return 0
+
+    profile.mkdir(parents=True, exist_ok=True)
+    for name in targets:
+        src, dest = personal / name, profile / name
+        if not is_skill(src):
+            print(f"  skipped {name}: no SKILL.md at {src}")
+            continue
+        if dest.exists() or dest.is_symlink():
+            print(f"  skipped {name}: already in the profile")
+            continue
+        dest.symlink_to(src, target_is_directory=True)
+        print(f"  linked {name} → {src}")
+    print("\nStart a new session for the harness to pick them up.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
