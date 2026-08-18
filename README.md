@@ -375,6 +375,18 @@ python3 -m agent2telegram remote-control off <session>   # force-disconnect one 
 python3 -m agent2telegram remote-control uninstall       # remove hooks, Skill and state
 ```
 
+## Surviving a reboot
+
+Hooks, the Skill, the package and the state all live on disk, so nothing needs reinstalling. The
+bridge is started for you the first time you connect. In practice: start your session as usual,
+run the toggle, done.
+
+The exception is inbound: **the bridge only starts when you connect**, so a message sent from
+Telegram before that is not received (Telegram holds it and delivers it once a bridge starts, but
+the session will not act on it until then). For a phone-first workflow, install the bridge as a
+boot service with `python3 -m agent2telegram service` — the auto-start detects it and stands
+aside.
+
 ## Documentation
 
 | Document | Contents |

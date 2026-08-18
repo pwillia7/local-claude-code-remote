@@ -158,6 +158,41 @@ up to. From then on, everything you do at the terminal appears there until you r
 From the chat you can also send `/stop` to interrupt a turn, and agent commands like `/compact`,
 `/context` or `/model <name>`.
 
+## After a reboot
+
+Worth knowing which links come back on their own and which you bring back by hand:
+
+| Link | After a reboot |
+| --- | --- |
+| the model endpoint (local server, or a forward to another host) | **out of scope for this project** — see below |
+| CCR | started by the launcher (`ccr start --no-open` is idempotent) |
+| the tmux seat + Claude Code | **you**, by running `qwen` |
+| the Agent2Telegram bridge | started automatically the first time you run `/qwen-remote` |
+| hooks, Skill, package, state | on disk, nothing to do |
+
+So the normal sequence after a restart is just `qwen`, then `/qwen-remote` in the session. The
+bridge does not need starting by hand.
+
+**The one gap:** the bridge starts *on connect*. Until you run the toggle at least once, nothing
+is polling Telegram, so a message you send from your phone before connecting is not received —
+Telegram queues it and it arrives once a bridge starts, but the session will not act on it in the
+meantime. If you want the phone to work without touching the terminal first, install the bridge
+as a boot service:
+
+```bash
+python3 -m agent2telegram service      # prints a systemd/launchd unit to install
+```
+
+That is upstream's model (always-on) and it composes fine with the auto-start, which detects a
+running bridge and leaves it alone.
+
+**The model endpoint is not this project's business.** A local server, a llama.cpp instance on
+another machine reached through a port forward or VPN, a hosted gateway — nothing here knows or
+cares. It is worth making yours start at boot in its own right (a systemd unit with
+`Restart=always` is the usual answer), because if the model path is down, turns fail at the
+*gateway*, and what you see in Telegram is a `StopFailure` notice rather than anything wrong with
+the mirror.
+
 ## Notes specific to this arrangement
 
 * A local model produces long, bursty text. The mirror throttles Telegram edits to one per
