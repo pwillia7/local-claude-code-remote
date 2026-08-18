@@ -1,297 +1,217 @@
-# Agent2Telegram
+# Local Claude Code Remote Control (via Telegram)
 
-[![CI](https://github.com/petrludwig-collab/Agent2Telegram/actions/workflows/ci.yml/badge.svg)](https://github.com/petrludwig-collab/Agent2Telegram/actions/workflows/ci.yml)
+Continue a **local, interactive Claude Code session** from Telegram — including sessions whose
+model backend is *not* the Anthropic API, such as a local model served through
+[Claude Code Router (CCR)](https://github.com/musistudio/claude-code-router) or any other LLM
+gateway or proxy.
+
+> **Unofficial.** This is not Anthropic's Remote Control, and this project is not affiliated
+> with Anthropic, Alibaba/Qwen, Claude Code Router or Telegram. It is a fork of
+> **[Agent2Telegram](https://github.com/petrludwig-collab/Agent2Telegram)** by
+> petrludwig-collab (MIT), which supplies the entire Telegram transport. Upstream's own README
+> is kept verbatim at [`docs/UPSTREAM_README.md`](docs/UPSTREAM_README.md).
+
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
-Talk to your coding agent — **Claude Code** or **Codex** — from **Telegram**.
+---
 
-Agent2Telegram is a tiny, dependency‑free bridge. It long‑polls Telegram for messages from
-**you** (and only you), hands each one to the agent CLI of your choice, and sends the reply
-back. No public IP, no webhook, no cloud — it runs on your own machine, behind your router.
+## The problem this solves
+
+Claude Code ships [Remote Control](https://code.claude.com/docs/en/remote-control), which pairs
+a local session with claude.ai and your phone. It requires the session to talk to
+`api.anthropic.com` directly: as of v2.1.196 it is **disabled whenever `ANTHROPIC_BASE_URL`
+points at another host**, and it is unavailable on Amazon Bedrock, Google Cloud's Agent Platform
+and Microsoft Foundry.
+
+That rules out an entire class of local harness — Claude Code as the agent loop, a local model
+(Qwen, Llama, …) as the brain, a gateway in between:
 
 ```
-Telegram  ⇄  Agent2Telegram  ⇄  claude / codex
+Claude Code  →  CCR gateway  →  local model
 ```
 
-**What you can send:** plain text, **images** and **files** (downloaded and handed to the
-agent), and **voice messages** — transcribed automatically when you add your own ElevenLabs
-key (see *Voice messages* below).
+Everything else about that setup is worth keeping: the tools, the permissions, the skills, the
+subagents, the filesystem access. Only the *remote surface* is missing.
+
+This project rebuilds that remote surface out of **documented Claude Code hooks** and sends it
+to Telegram.
+
+## What you get
+
+Enable it for a session and your phone shows the local seat, live:
+
+| Locally | In Telegram |
+| --- | --- |
+| you type a prompt | `🖥️ You: investigate why pending transactions are duplicated` |
+| the model starts answering | the text appears and **grows as it streams** |
+| it reads a file | a temporary status bubble: `📄 Reading transactions.ts` |
+| it edits, then runs tests | the same bubble updates: `✏️ Editing reconcile.ts` → `🛠️ Run the test suite` |
+| a subagent or task runs | `🤖 Explore running`, `📋 Working: reconcile pending transactions` |
+| the turn ends | the bubble disappears; the answer stays |
+| the API errors out | `⚠️ Turn ended with an error (overloaded)` |
+| a tool needs permission | `🔐 Waiting for permission` — **notification only** |
+
+It works in both directions: messages you send **from** Telegram drive the same live tmux
+session through Agent2Telegram's existing attach mode, exactly as before.
+
+## Key properties
+
+* **Claude Code and your tools stay local.** Nothing about the agent moves off the machine;
+  Telegram is only a display and an input.
+* **No inbound ports, no webhook, no web server.** Telegram long polling only, so it works
+  behind NAT and a strict firewall.
+* **Per-session opt-in.** Mirroring is off until you run the Skill in that specific session.
+  A normal session stays entirely local.
+* **`/compact` and `/clear` keep it connected**; a fresh `startup`, `resume` or `fork` starts
+  disconnected — the same rule native Remote Control uses.
+* **No terminal scraping and no transcript parsing** on the local-mirror path. Assistant text
+  comes from the documented `MessageDisplay` hook.
+* **Hooks do no network I/O.** They write one small file and exit; the long-running bridge does
+  every Telegram call.
+* **Telegram-originated turns are never duplicated.** `UserPromptSubmit` classifies each turn's
+  origin, and the mirror only ever handles terminal-originated ones.
+* **Qwen through CCR is the reference configuration** — see
+  [`docs/QWEN_CCR_SETUP.md`](docs/QWEN_CCR_SETUP.md). Nothing in the package is Qwen-specific.
+
+**Current limitation:** remote permission approval is **notification-only**. You are told that
+Claude Code is waiting for a decision; you still make that decision at the terminal. Nothing is
+ever auto-approved, no `--dangerously-skip-permissions` is added, and your permission mode is
+never weakened.
 
 ---
 
-## Why it’s built this way
+## How it works
 
-- **Robust by default** — one bad message never crashes the loop; network errors, Telegram
-  flood‑control (`429`), 4096‑char limits and Markdown parse failures are all handled.
-- **Secure** — the agent can run code on your machine, so only **allow‑listed Telegram
-  users** can drive it. Everyone else is politely refused.
-- **Zero install friction** — the core uses **only the Python standard library**. Nothing to
-  `pip install` for it to work, which means far fewer “it doesn’t run on my machine” moments.
-- **Works behind NAT** — long polling, so no port‑forwarding or domain needed.
+```
+        local model  ←  CCR gateway  ←  Claude Code  ─── documented hooks ───┐
+                                            │                               │
+                                            │                        remote-control
+                          Telegram ─── tmux send-keys ───┐              hook adapter
+                                                         │                  │
+                                                         │           fast local spool
+                                                         │                  │
+                                                  Agent2Telegram AttachBridge
+                                                                  │
+                                                              Telegram
+```
+
+* **Terminal → Telegram** (new): Claude Code hooks → `agent2telegram.remote_control.core` writes
+  a small JSON event into a private spool → the bridge drains the spool and streams to Telegram.
+* **Telegram → Claude Code** (unchanged upstream behaviour): the bridge injects the message into
+  the live tmux session with an `[TG]` origin prefix and forwards the reply from the transcript.
+
+Full event-by-event walkthrough: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ---
 
-## Quick start
+## Requirements
+
+* Claude Code (`claude`) — the hook events used here need a recent version (`MessageDisplay`,
+  `SubagentStart`, `TaskCreated`/`TaskCompleted`, `StopFailure`).
+* Python 3.10+ — the runtime has **zero** third-party dependencies.
+* `tmux` — hosts the session the bridge attaches to.
+* A Telegram bot token and your numeric Telegram user id.
+
+## Install
 
 ```bash
-# 1) Get the code
-git clone https://github.com/petrludwig-collab/Agent2Telegram.git
-cd Agent2Telegram
+git clone https://github.com/<you>/local-claude-code-remote.git
+cd local-claude-code-remote
+python3 -m pip install --user .          # or: pip install --user -e . while developing
 
-# 2) Run the setup wizard (pick agent → paste token → authorize yourself)
+# 1. one-time Agent2Telegram setup (bot token, your user id, attach mode + tmux session)
 python3 -m agent2telegram setup
 
-# 3) Start the bridge
+# 2. install the Remote Control Skill and merge the hooks into Claude Code's settings.json
+python3 -m agent2telegram remote-control install \
+    --claude-config-dir "$CLAUDE_CONFIG_DIR" \
+    --tmux-session <tmux-session> \
+    --skill-name local-remote \
+    --label "Local Remote Control"
+
+# 3. check the whole chain
+python3 -m agent2telegram remote-control doctor --claude-config-dir "$CLAUDE_CONFIG_DIR"
+```
+
+`--claude-config-dir` defaults to `$CLAUDE_CONFIG_DIR`, then `~/.claude`. `--agent2telegram-config`
+defaults to `$AGENT2TELEGRAM_CONFIG`, then the config in `~/.config/agent2telegram/` whose
+`tmux_session` matches. Add `--dry-run` to see the changes without making them.
+
+The installer:
+
+* verifies Claude Code, the bridge config, `tmux` and the Claude config directory;
+* installs the Skill with this machine's paths filled in;
+* **merges** its hook entries into `settings.json` without touching anyone else's hooks;
+* backs the file up first, is idempotent, and reports exactly what it changed.
+
+Then start the bridge (see `python3 -m agent2telegram service` for a systemd/launchd unit):
+
+```bash
 python3 -m agent2telegram run
 ```
 
-…or the one‑liner:
+Run **exactly one** bridge per bot token — Telegram allows only one long-poll consumer.
+
+## Use
+
+In the Claude Code session you want to mirror:
+
+```
+/local-remote
+```
+
+Telegram gets `🟢 … connected`. Run it again to disconnect. That is the whole interface — the
+Skill sets `disable-model-invocation: true`, so the model can never enable mirroring on its own.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/petrludwig-collab/Agent2Telegram/main/install.sh | bash
+python3 -m agent2telegram remote-control status          # what is mirrored right now
+python3 -m agent2telegram remote-control off <session>   # force-disconnect one session
+python3 -m agent2telegram remote-control uninstall       # remove hooks, Skill and state
 ```
 
-### What the wizard asks (3 steps)
-1. **Provider** — it auto-detects which agents are installed (Claude Code / Codex) and you pick one.
-2. **Session** — attach to an existing **tmux** session or create a fresh one (the wizard
-   launches the chosen agent in it for you).
-3. **Telegram** — paste the bot token from [@BotFather](https://t.me/BotFather); the wizard
-   verifies it live, then captures your user id from the first message you send the bot and wires
-   everything up. It can start the bridge for you on the spot.
+## Documentation
 
-Codex needs no extra setup — its rollout log records turn boundaries. For Claude Code the wizard
-also registers the end-of-turn **Stop hook** automatically.
+| Document | Contents |
+| --- | --- |
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | event flows, state layout, spool contract, design rationale |
+| [`docs/QWEN_CCR_SETUP.md`](docs/QWEN_CCR_SETUP.md) | the reference Qwen + CCR + tmux + Telegram arrangement |
+| [`docs/SECURITY.md`](docs/SECURITY.md) | threat model, what is stored, what is never stored |
+| [`docs/UPSTREAM_README.md`](docs/UPSTREAM_README.md) | upstream Agent2Telegram's README, verbatim |
+| [`examples/`](examples) | sanitized launcher, shell integration and bridge config |
 
-You get the same live UX both ways: progress messages kept, a one-line italic status bubble for
-tool calls that trails at the bottom and clears at the end, and a `typing…` indicator that stays
-lit for the whole turn.
+## Compatibility
 
-### Connect more agents (one bot each)
+Exercised on Linux with Claude Code 2.1.x routed through CCR to a local Qwen model, Python 3.11
+and 3.14, and Agent2Telegram attach mode. Other gateways, models and platforms should work — the
+implementation only depends on documented hook events — but are untested, and this README does
+not claim more than has actually been run.
 
-Running several agents (e.g. one per tmux session)? Give each its own bot in one step:
+## Relationship to upstream
 
-```bash
-python3 -m agent2telegram connect            # pick a session → pick provider → paste token
-```
+This repository keeps the full Agent2Telegram git history, its MIT `LICENSE`, and its transport,
+retry, flood-control, attach-mode, media, voice and self-test behaviour. Upstream's tests still
+run and pass. The changes are additive:
 
-`connect` writes a **separate** config (`~/.config/agent2telegram/<name>.json`), starts that
-bridge alongside the others, and — for Claude Code — pins the session id so the Stop hook routes
-each turn-end to the right bridge. Your existing bots are left untouched. Name it explicitly with
-`--name`.
+| File | Change |
+| --- | --- |
+| `agent2telegram/remote_control/` | **new** — hook adapter, spool, mirror, CLI, installer, Skill template |
+| `agent2telegram/attach.py` | consume the spool in the outbound loop; the typing indicator honours the mirror; the durable send path takes a `parse_mode` |
+| `agent2telegram/readers.py` | the Claude tool summarizer moved to `remote_control.core` so the hook path shares it |
+| `agent2telegram/__main__.py` | the `remote-control` command |
+| `tests/test_remote_control.py` | **new** |
 
-### Update
+Upstream is kept as the `upstream` git remote. Nothing here is pushed to it.
 
-```bash
-python3 -m agent2telegram update             # git pull + restart every running bridge on the new code
-```
+## Future work
 
-Pulls the latest code into `~/.agent2telegram-src` and restarts each running bridge, preserving
-its own `--config` — no re-setup, no re-entering tokens.
+* Telegram inline **Allow/Deny** buttons for `PermissionRequest`.
+* Multiple CCR profiles/models against one bridge, and a generic Skill alias.
+* Transports other than Telegram.
+* Upstreaming the generic hook-event adapter to Agent2Telegram.
+* Richer reconnection/session status in the chat.
 
----
+## Licence
 
-## Install with an agent (easiest for beginners, fresh server)
-
-If you already have **Codex** (or Claude Code) installed and logged in, you can let it do
-the whole install and fix any environment hiccups itself. The repo ships an
-[`AGENTS.md`](AGENTS.md) playbook the agent follows step by step.
-
-Three steps:
-1. **Install the agent CLI and log in** (the one genuinely manual part on a clean machine):
-   - Codex — <https://github.com/openai/codex>, then run `codex` once to sign in.
-   - or Claude Code — <https://docs.claude.com/claude-code>, then run `claude` once.
-2. **Have a Telegram bot token ready** (create a bot with [@BotFather](https://t.me/BotFather)).
-3. **Paste this prompt** into your agent:
-
-   > Install **Agent2Telegram** from `https://github.com/petrludwig-collab/Agent2Telegram`
-   > by following its `AGENTS.md` exactly. Connect it to **me on Telegram**. Ask me for the
-   > bot token and my Telegram user id when you need them. Do not weaken the security rules.
-   > When finished, verify with `python3 -m agent2telegram doctor` and confirm I get a reply
-   > from the bot.
-
-The agent reads `AGENTS.md`, checks prerequisites, installs, configures, verifies with
-`doctor`, and sets up auto‑start. Because the package is dependency‑free and self‑diagnosing,
-the agent has an easy, checkable job — and can repair the rare clean‑server quirk on its own.
-
-> Prefer a deterministic install with no agent? Use the **Quick start** above or the one‑liner.
-
-## Prerequisites
-
-- **Python 3.10+**
-- The agent you want to connect, **installed and logged in**:
-  - Claude Code — <https://docs.claude.com/claude-code> (run `claude` once to sign in)
-  - Codex — <https://github.com/openai/codex> (run `codex` once to sign in)
-
-The bridge shells out to these tools, so whatever they can do in your terminal, they can do
-from Telegram.
-
----
-
-## Commands (in chat)
-
-| Command | What it does |
-|---|---|
-| *(any text)* | sent straight to the live agent |
-| `/start`, `/help` | short intro + what you can send |
-| `/status` | which agent + tmux session you're connected to (and whether voice is on) |
-| `/setkey <key>` | enable voice transcription with your ElevenLabs key — your message is deleted right after so the key isn't left in the chat |
-| `/id` | show your user / chat id (handy for the allow‑list) |
-
-Anything that isn't one of these (including other `/commands`) is passed through to the agent.
-
----
-
-## Self-test (no bot needed)
-
-Run the whole attach experience against a *real* agent with a fake Telegram — it needs no bot
-token and touches nothing live. It spins up a throwaway tmux session, launches the agent, and
-checks text round-trip, a ❤️ reaction, a multi-step task (tool-call status bubble), and voice
-transcription:
-
-```bash
-python3 -m agent2telegram selftest --agent codex
-python3 -m agent2telegram selftest --agent claude-code
-```
-
-Both report `6/6 checks passed` on a working setup.
-
----
-
-## Uninstall
-
-One line — the exact mirror of the install one‑liner:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/petrludwig-collab/Agent2Telegram/main/uninstall.sh | bash
-```
-
-That stops any running bridge and removes **everything**: the config (token included), state,
-the source clone, the launcher, the Claude Code Stop hook, and the pip package — no leftovers,
-no manual steps. (If you prefer, the equivalent from a clone is `python3 -m agent2telegram
-uninstall`; add `--yes` to skip the confirmation prompt.)
-
----
-
-## Proactive notifications (cron / background jobs)
-
-The bridge forwards the agent's replies **during a Telegram‑originated turn**. A cron job, a
-background task, or a long build can't reach you that way — there's no turn to reply in. For
-those, push a message to yourself with:
-
-```bash
-python3 -m agent2telegram notify "build finished ✅"
-echo "deploy done" | python3 -m agent2telegram notify          # or pipe it on stdin
-python3 -m agent2telegram notify --config ~/.config/agent2telegram/codex-config.json "…"
-```
-
-It sends to the configured owner via the bot (Markdown rendered, same as chat replies). Handy
-in a `cron` line or at the end of a script so the agent tells you when something finishes.
-
----
-
-## Voice messages (optional)
-
-Voice notes are transcribed with **ElevenLabs Scribe** (`scribe_v1`) and the transcript is
-sent to the agent. It's **off by default** and uses **your own** API key — there is no shared
-key and no extra Python dependency.
-
-Enable it by setting your key (get one at <https://elevenlabs.io>):
-```bash
-export ELEVENLABS_API_KEY="sk_..."     # or put "elevenlabs_api_key" in config.json
-```
-Without a key, voice messages get a short "not enabled" notice. Images and files work with no
-extra setup.
-
-## Configuration
-
-Stored at `~/.config/agent2telegram/config.json` (mode `0600`). The token may instead be
-provided via the `TELEGRAM_BOT_TOKEN` environment variable to keep it out of the file.
-
-```json
-{
-  "agent": "claude-code",
-  "token": "123456:ABC...",
-  "allowed_user_ids": [123456789],
-  "agent_timeout": 600,
-  "command": null,
-  "continue_command": null
-}
-```
-
-**Custom command** — the default invocation for each agent is overridable, because these CLIs
-evolve. Use `{prompt}` where the message should go:
-
-```json
-{
-  "agent": "codex",
-  "command": ["codex", "exec", "--model", "gpt-5.5", "{prompt}"],
-  "continue_command": ["codex", "exec", "--last", "{prompt}"]
-}
-```
-
-Run `python3 -m agent2telegram doctor` to validate everything (config, token, agent binary).
-
----
-
-## Run it forever (boot + auto‑restart)
-
-```bash
-# Prints a systemd unit (Linux) or launchd plist (macOS) to stdout, hints to stderr:
-python3 -m agent2telegram service
-```
-
-Follow the printed steps. On Linux you’ll typically:
-
-```bash
-mkdir -p ~/.config/systemd/user
-python3 -m agent2telegram service > ~/.config/systemd/user/agent2telegram.service
-systemctl --user enable --now agent2telegram
-loginctl enable-linger "$USER"
-```
-
----
-
-## Docker
-
-The image is tiny, but the **agent CLI and its login are not baked in** (auth must stay out of
-images). Mount an authenticated agent and your config:
-
-```bash
-docker build -t agent2telegram .
-docker run -d --name agent2telegram \
-  -v "$HOME/.config/agent2telegram:/data" \
-  -v "$HOME/.claude:/root/.claude" \      # example: bring your Claude Code login
-  agent2telegram
-```
-
----
-
-## Security notes
-
-- **Allow‑list is the only thing between a stranger and code execution on your box.** Keep it
-  tight. An unauthorized user gets a refusal and their own id (so you can add them on purpose).
-- The bot token is a secret: the config file is `0600`, the token is never logged, and `/status`
-  / `doctor` always print it redacted.
-- Prompts are passed to the agent as a single `argv` element (never through a shell), so a
-  message can’t inject shell syntax.
-- **The wizard launches the agent with its "run without asking" flag** (Codex
-  `--dangerously-bypass-approvals-and-sandbox`, Claude Code `--dangerously-skip-permissions`) —
-  the bridge drives it unattended, so it can't stop to ask you to approve each command. That
-  makes the allow‑list and a least‑privileged user the real safeguards. If you'd rather approve
-  every action by hand, start the agent yourself without the flag and point the wizard at that
-  tmux session instead of creating a new one.
-- Consider running the agent under a dedicated, least‑privileged user.
-
----
-
-## Development
-
-```bash
-python3 -m unittest discover -s tests -v   # zero-dependency test suite
-```
-
-## License
-
-MIT — see [LICENSE](LICENSE).
+MIT — see [`LICENSE`](LICENSE). The original copyright is retained; this fork adds to it.

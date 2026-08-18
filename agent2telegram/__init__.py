@@ -1,4 +1,10 @@
-"""Agent2Telegram — connect a coding agent (Claude Code or Codex) to Telegram.
+"""Local Claude Code Remote Control — a fork of Agent2Telegram (MIT, petrludwig-collab).
+
+Upstream connects a coding agent (Claude Code or Codex) to Telegram. This fork adds
+:mod:`agent2telegram.remote_control`: a hook-driven mirror of a **local, interactive** Claude
+Code session, for harnesses where native Claude Code Remote Control cannot work because the
+model backend is an LLM gateway (Claude Code Router, a proxy, …) rather than api.anthropic.com.
+Everything upstream does still works unchanged.
 
 A small, dependency-free bridge: it long-polls Telegram for messages from authorized
 users, hands each message to the configured agent CLI, and streams the reply back.
@@ -9,4 +15,4 @@ Design goals (in priority order):
   3. Zero install friction — the core uses only the Python standard library.
 """
 
-__version__ = "1.2.0"
+__version__ = "1.2.0+local-remote.1"

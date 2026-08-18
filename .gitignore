@@ -18,3 +18,21 @@ config.json
 *.swp
 .idea/
 .vscode/
+
+# Local Remote Control — machine state and anything materialized by the installer
+remote-control/
+*.bak-remote-control-*
+settings.json.bak-*
+skill-installed/
+
+# Never commit real integration files or captured payloads
+config.json
+config.local.json
+service.json
+*.pem
+*.key
+credentials*.json
+answer.txt
+events/
+*.jsonl
+transcripts/

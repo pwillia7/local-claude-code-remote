@@ -151,6 +151,36 @@ class AttachBridge:
         self._seen_tools: set = set()
         self._tui_seen: set = set()          # Codex TUI scrape: tool lines already shown this turn
         self._turn_text_sent = False         # has any text been forwarded this turn (bubble gate)
+        # ---- local Remote Control (hook-driven mirror of the TERMINAL side of the session) ----
+        # Separate from _turn_active on purpose: that flag drives the Telegram-originated turn
+        # (including its backstop and idle fallback) and must keep its exact meaning.
+        self._remote_active = threading.Event()
+        self._remote = self._build_remote_mirror(_slug)
+
+    # ---- local Remote Control ---------------------------------------------
+    def _build_remote_mirror(self, slug: str):
+        """Consumer for the Remote Control spool, or None when it cannot be used.
+
+        Every Telegram operation is a bound method of this bridge, so the mirror reuses the
+        durable send queue, the single status bubble and the typing indicator rather than
+        growing a second implementation of any of them."""
+        if self._owner_chat is None or self.cfg.agent != "claude-code":
+            return None
+        try:
+            from .remote_control.mirror import RemoteControlMirror
+        except Exception as e:                       # never stop the bridge over the mirror
+            log.warning("remote control unavailable: %s", e)
+            return None
+        return RemoteControlMirror(
+            slug,
+            send_plain_id=lambda text: self.tg.send_plain_id(self._owner_chat, text),
+            edit_plain=lambda mid, text: self.tg.edit_plain(self._owner_chat, mid, text),
+            send_text=lambda text, parse_mode="auto": self._send_final(text, parse_mode=parse_mode),
+            status_push=self._status_push,
+            status_clear=self._status_clear,
+            set_active=lambda on: (self._remote_active.set() if on
+                                   else self._remote_active.clear()),
+        )
 
     # ---- transcript resolution --------------------------------------------
     def _codex_sessions_dir(self) -> Path:
@@ -387,23 +417,27 @@ class AttachBridge:
         except OSError:
             pass
 
-    def _enqueue(self, text: str, key: str | None) -> None:
-        self._pending_send.append({"text": text, "key": key})
+    def _enqueue(self, text: str, key: str | None, parse_mode: str = "auto") -> None:
+        self._pending_send.append({"text": text, "key": key, "parse_mode": parse_mode})
         self._persist_queue()
 
-    def _send_final(self, text: str, key: str | None = None) -> None:
+    def _send_final(self, text: str, key: str | None = None,
+                    parse_mode: str = "auto") -> None:
         """Forward one reply RELIABLY. Marks the dedup ledger only AFTER a confirmed send; on any
         send failure the reply is queued to disk and the outbound loop keeps retrying until Telegram
-        confirms. Order is preserved: if anything is already queued, this appends behind it."""
+        confirms. Order is preserved: if anything is already queued, this appends behind it.
+
+        ``parse_mode=None`` forwards verbatim — used by the Remote Control mirror for content
+        that is not the agent's Markdown (a local prompt, an error notice)."""
         if not text or self._owner_chat is None:
             return
         if key and key in self._sent_keys:
             return
         if self._pending_send:                       # something already waiting → keep FIFO order
-            self._enqueue(text, key)
+            self._enqueue(text, key, parse_mode)
             return
         try:
-            self.tg.send_message(self._owner_chat, text)
+            self.tg.send_message(self._owner_chat, text, parse_mode=parse_mode)
         except Exception as e:                        # network reset, 5xx after retries, etc.
             log.warning("forward failed → queued for re-delivery: %s", e)
             self._enqueue(text, key)
@@ -419,7 +453,8 @@ class AttachBridge:
         while self._pending_send and self._owner_chat is not None:
             item = self._pending_send[0]
             try:
-                self.tg.send_message(self._owner_chat, item.get("text", ""))
+                self.tg.send_message(self._owner_chat, item.get("text", ""),
+                                     parse_mode=item.get("parse_mode", "auto"))
             except Exception as e:
                 log.warning("re-delivery still failing (%d queued): %s", len(self._pending_send), e)
                 return
@@ -587,7 +622,8 @@ class AttachBridge:
         cause of mid-turn typing gaps. It stops the instant the turn ends (turn_active cleared), so
         no action fires after the final message and typing stops with it (bar Telegram's ~5s decay)."""
         while not self._stop.is_set():
-            if self._turn_active.is_set() and self._owner_chat is not None:
+            if ((self._turn_active.is_set() or self._remote_active.is_set())
+                    and self._owner_chat is not None):
                 now = time.monotonic()
                 gap = now - self._last_typing
                 if gap > self._max_gap:
@@ -684,6 +720,10 @@ class AttachBridge:
     def _outbound_loop(self) -> None:
         while not self._stop.is_set():
             try:
+                if self._remote is not None:
+                    # Drain the hook spool FIRST: a terminal-originated turn must finish its
+                    # streamed messages before the shared Stop handling clears the bubble.
+                    self._remote.tick()
                 self._maybe_reresolve()
                 self._flush_pending()         # re-deliver any reply a prior send failed to push
                 self._drain_transcript()      # may set _pending_turn_end (Codex task_complete)

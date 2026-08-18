@@ -1,0 +1,40 @@
+{
+  "_comment": [
+    "Example ONLY. The real file lives at ~/.config/agent2telegram/config.json, is written",
+    "0600 by `python3 -m agent2telegram setup`, contains your bot token, and must never be",
+    "committed. Replace every <placeholder>.",
+    "",
+    "agent          claude-code | codex",
+    "mode           'attach' drives an existing live tmux session (required for Remote Control)",
+    "tmux_session   the persistent seat both you and Telegram drive",
+    "origin_prefix  injected before every Telegram-originated prompt; this is what tells the",
+    "               Remote Control hook that a turn is NOT terminal-originated, so it is never",
+    "               mirrored twice",
+    "transcript_path 'auto' resolves the session's own transcript, scoped by working directory",
+    "signal_file    where the Stop hook signals turn end; its parent is the state directory",
+    "token          from @BotFather — or leave it out and export TELEGRAM_BOT_TOKEN instead",
+    "allowed_user_ids  numeric Telegram user ids allowed to drive the agent. Keep this tight:",
+    "               anyone on the list can run code on this machine. 123456789 below is a",
+    "               placeholder — send /id to your bot to learn your real one."
+  ],
+
+  "agent": "claude-code",
+  "mode": "attach",
+  "tmux_session": "<tmux-session>",
+
+  "origin_prefix": "[TG] ",
+  "progress_marker": "[TG]",
+  "transcript_path": "auto",
+  "claude_session_id": "",
+
+  "signal_file": "/home/<you>/.local/state/agent2telegram/answer.txt",
+  "workdir": "",
+
+  "token": "<telegram-bot-token>",
+  "allowed_user_ids": [123456789],
+  "bot_username": "<your-bot-username>",
+
+  "elevenlabs_api_key": "",
+  "agent_timeout": 600,
+  "poll_timeout": 50
+}

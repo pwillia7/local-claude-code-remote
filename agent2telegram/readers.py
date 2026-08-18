@@ -25,8 +25,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import urllib.parse
 from dataclasses import dataclass
+
+from .remote_control import core as _core
 
 
 @dataclass
@@ -37,9 +38,9 @@ class Ev:
     final: bool = False      # for 'text': hint that this is the final answer
 
 
-def _short(s: str, n: int = 58) -> str:
-    s = " ".join(str(s).split()).replace("**", "").replace("`", "")
-    return s if len(s) <= n else s[:n - 1] + "…"
+#: Shared with the Remote Control mirror so a tool call is summarized identically whether it
+#: reaches Telegram through the transcript reader or through a Claude Code hook.
+_short = _core.short
 
 
 def _hash(s: str) -> str:
@@ -48,29 +49,9 @@ def _hash(s: str) -> str:
 
 # --------------------------------------------------------------------------- Claude Code
 
-def _claude_tool_summary(name: str, inp: dict) -> str:
-    inp = inp if isinstance(inp, dict) else {}
-    if name == "Bash":
-        return "🛠️ " + _short(inp.get("description") or inp.get("command", "command"))
-    if name == "Read":
-        return "📄 Reading " + _short(os.path.basename(inp.get("file_path", "")) or "file")
-    if name in ("Edit", "Write", "NotebookEdit"):
-        return "✏️ Editing " + _short(os.path.basename(inp.get("file_path", "")) or "file")
-    if name in ("Grep", "Glob"):
-        return "🔎 Searching " + _short(inp.get("pattern", ""))
-    if name == "WebFetch":
-        try:
-            host = urllib.parse.urlparse(inp.get("url", "")).netloc or inp.get("url", "")
-        except Exception:
-            host = inp.get("url", "")
-        return "🌐 Web " + _short(host)
-    if name == "WebSearch":
-        return "🔎 Web search: " + _short(inp.get("query", ""))
-    if name in ("Agent", "Task"):
-        return "🤖 " + _short(inp.get("description") or "subagent")
-    if name.startswith("mcp__"):
-        return "🔌 " + _short(name.replace("mcp__", "").replace("__", " "))
-    return "🛠️ " + _short(name or "tool")
+#: Claude Code tool → one-line bubble summary. Lives in remote_control.core because the hook
+#: path must summarize the very same call without importing the transcript readers.
+_claude_tool_summary = _core.tool_summary
 
 
 def _text_of(content) -> str:

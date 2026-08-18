@@ -4,12 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent2telegram"
-version = "1.1.0"
-description = "Connect a coding agent (Claude Code or Codex) to Telegram."
+version = "1.2.0+local-remote.1"
+description = "Local Claude Code Remote Control via Telegram — a fork of Agent2Telegram that mirrors a local Claude Code session driven by CCR or another LLM gateway."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
-keywords = ["telegram", "claude-code", "codex", "agent", "bot", "bridge"]
+keywords = ["telegram", "claude-code", "codex", "agent", "bot", "bridge",
+            "remote-control", "hooks", "ccr", "llm-gateway", "qwen"]
 # Core runtime intentionally has ZERO third-party dependencies (stdlib only) so it
 # installs cleanly anywhere. That is a feature, not an omission.
 dependencies = []
@@ -22,3 +23,7 @@ dev = ["pytest"]
 
 [tool.setuptools.packages.find]
 include = ["agent2telegram*"]
+
+# The Remote Control Skill is shipped as a template and materialized by the installer.
+[tool.setuptools.package-data]
+"agent2telegram.remote_control" = ["skill/SKILL.md", "skill/scripts/*.sh"]

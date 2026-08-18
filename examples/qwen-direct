@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+#
+# Example launcher: start Claude Code through Claude Code Router (CCR) against a local model.
+#
+# Install as e.g. $HOME/.local/bin/qwen-direct and replace <ccr-profile> with the CCR profile
+# name you configured (`ccr` lists them). Nothing about Remote Control belongs in here — the
+# hooks live in the profile's Claude settings.json, which the installer edits.
+#
+set -euo pipefail
+
+# Resolve CCR from PATH; override with CCR_BIN if it lives somewhere unusual
+# (a Homebrew/Linuxbrew prefix, for instance).
+CCR_BIN="${CCR_BIN:-$(command -v ccr || true)}"
+
+if [[ -z "$CCR_BIN" ]]; then
+    echo "Claude Code Router ('ccr') is not on PATH. Set CCR_BIN." >&2
+    exit 1
+fi
+
+# Idempotent: does nothing if the router is already up.
+if ! "$CCR_BIN" start --no-open >/dev/null 2>&1; then
+    echo "Couldn't start Claude Code Router." >&2
+    exit 1
+fi
+
+# CCR sets CLAUDE_CONFIG_DIR to this profile's own Claude directory, so the profile's
+# settings.json, hooks and skills apply — and never touch ~/.claude.
+exec "$CCR_BIN" "<ccr-profile>" cli -- "$@"

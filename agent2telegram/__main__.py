@@ -5,6 +5,10 @@ Commands:
   run       start the bridge
   service   print an OS service unit (systemd/launchd) for boot persistence
   doctor    check the current config and agent availability
+  remote-control
+            mirror a LOCAL Claude Code session to Telegram via documented hooks (see
+            agent2telegram.remote_control) — for harnesses where native Claude Code
+            Remote Control is unavailable, e.g. sessions routed through an LLM gateway.
 """
 from __future__ import annotations
 
@@ -214,6 +218,8 @@ def main(argv: list[str] | None = None) -> int:
     st.add_argument("--keep", action="store_true", help="keep the throwaway tmux session afterwards")
     un = sub.add_parser("uninstall", help="stop the bridge and remove config + state")
     un.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
+    from .remote_control import cli as _rc_cli
+    _rc_cli.add_parser(sub)
 
     args = parser.parse_args(argv)
     _setup_logging(args.verbose)
@@ -244,6 +250,9 @@ def main(argv: list[str] | None = None) -> int:
         return selftest.run(args.agent, keep=args.keep)
     if args.command == "uninstall":
         return _cmd_uninstall(args)
+    if args.command == "remote-control":
+        from .remote_control import cli as rc_cli
+        return rc_cli.run(args)
     parser.error("unknown command")
     return 2
 
